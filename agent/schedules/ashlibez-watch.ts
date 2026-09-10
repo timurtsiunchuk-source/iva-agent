@@ -17,8 +17,8 @@ export default defineSchedule({
         root,
         nodeBin: process.execPath,
         statusPath,
-        guardMs: 4 * 60_000,
-        timeoutMs: 5 * 60_000,
+        guardMs: 5 * 60_000,
+        timeoutMs: 8 * 60_000, // до 3 тегов × ход агента; guard < timeout
       }),
     );
   },
