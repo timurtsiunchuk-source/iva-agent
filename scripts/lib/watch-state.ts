@@ -81,15 +81,21 @@ export function saveWatchState(
   renameSync(tmp, path);
 }
 
-// «Свежие» = не в seen-списке и внутри окна чтения (окно шире тика — ничего между
-// тиками не теряется).
+// «Свежие» = не в seen-списке и новее последнего зафиксированного сообщения.
+// Основная граница — state.lastTs (время последнего увиденного сообщения): так
+// ничего между тиками не теряется, даже если тик был пропущен guard-ом.
+// Скользящее окно now - lookbackMinutes — только страховка при первом запуске
+// (когда lastTs ещё нет); после простоя seenIds отсекают старьё.
 export function freshMessages(
   messages: ProxyMessage[],
   state: WatchState,
   lookbackMinutes: number,
 ): ProxyMessage[] {
   const seen = new Set(state.seenIds ?? []);
-  const cutoff = Date.now() - lookbackMinutes * 60_000;
+  const now = Date.now();
+  const lookbackCutoff = now - lookbackMinutes * 60_000;
+  const lastTsCutoff = state.lastTs ? Date.parse(state.lastTs) : 0;
+  const cutoff = lastTsCutoff > 0 ? lastTsCutoff : lookbackCutoff;
   return messages
     .filter((m) => Date.parse(m.date) > cutoff && !seen.has(m.id))
     .sort((a, b) => a.id - b.id);

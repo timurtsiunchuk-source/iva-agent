@@ -59,6 +59,19 @@ test("freshMessages with empty state treats everything inside the window as fres
   assert.equal(freshMessages([msg(11, 30, "old")], {}, 15).length, 0);
 });
 
+test("freshMessages: message older than lookback window but newer than lastTs is fresh", () => {
+  // Тик пропущен guard-ом: сообщение пришло между тиками и уже старше скользящего
+  // окна, но стейт его ещё не видел (lastTs раньше). Потеря таких сообщений —
+  // баг 2026-09-10 (тег 10:00:55 МСК пропал между тиками 10:00 и 10:10).
+  const messages = [
+    msg(1, 12, "arrived between ticks, outside lookback"),
+    msg(2, 3, "fresh inside lookback"),
+  ];
+  const state = { seenIds: [], lastTs: minutesAgo(20) };
+  const fresh = freshMessages(messages, state, 7);
+  assert.deepEqual(fresh.map((m) => m.id), [1, 2]);
+});
+
 test("saveWatchState/readWatchState roundtrip keeps ids, lastTs, lastSentAt", () => {
   const dir = mkdtempSync(join(tmpdir(), "iva-watch-state-"));
   const prevCwd = process.cwd();
