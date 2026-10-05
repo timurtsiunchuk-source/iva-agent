@@ -1,6 +1,14 @@
+import {
+  resolveMemoryNightTime,
+  memoryNightBuildSettings,
+  MEMORY_NIGHT_BUILD_FILE,
+  MEMORY_NIGHT_CONFIG_FILE,
+} from "../agent/lib/memory-night-time.ts";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   cpSync,
+  copyFileSync,
+  writeFileSync,
   existsSync,
   lstatSync,
   mkdtempSync,
@@ -10,7 +18,7 @@ import {
   rmSync,
   symlinkSync,
 } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   archiveInvalidCustomLayer,
@@ -24,6 +32,7 @@ import {
 } from "./lib/custom-layer.ts";
 import { resolveDataDir } from "./lib/data-dir.ts";
 import { classifyRoot, isEntrypoint } from "./lib/version-layout.ts";
+import { vaultDirOrExit } from "./lib/vault-boundary.ts";
 
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
 const BUILD_ROOT = join(ROOT, ".iva-build");
@@ -50,15 +59,7 @@ function dataDir(): string {
 }
 
 function copySourceTree(staging: string): void {
-  const configuredVault = process.env.ASSISTANT_VAULT_DIR || "vault";
-  const privateRoots = [
-    resolve(dataDir()),
-    resolve(
-      isAbsolute(configuredVault)
-        ? configuredVault
-        : join(ROOT, configuredVault),
-    ),
-  ];
+  const privateRoots = [resolve(dataDir()), vaultDirOrExit(ROOT)];
   const isPrivateRoot = (source: string): boolean => {
     const absolute = resolve(source);
     return privateRoots.some(
@@ -136,6 +137,7 @@ function restoreAgentSummary(backup: string | null): void {
 }
 
 export function buildWithCustomLayer(): void {
+  const nightTime = resolveMemoryNightTime(process.env.MEMORY_NIGHT_TIME);
   mkdirSync(BUILD_ROOT, { recursive: true });
   const staging = mkdtempSync(join(BUILD_ROOT, "staging-"));
   let materialized: MaterializedCustomLayer | null = null;
@@ -200,6 +202,8 @@ export function buildWithCustomLayer(): void {
       }
     }
 
+    const nightSettings = join(staging, MEMORY_NIGHT_BUILD_FILE);
+    writeFileSync(nightSettings, memoryNightBuildSettings(nightTime));
     const npm = process.platform === "win32" ? "npm.cmd" : "npm";
     const built = spawnSync(npm, ["run", "build:core"], {
       cwd: staging,
@@ -208,6 +212,10 @@ export function buildWithCustomLayer(): void {
     });
     if (built.error) throw built.error;
     if (built.status !== 0) throw new Error("core build failed");
+    copyFileSync(
+      nightSettings,
+      join(staging, ".output", MEMORY_NIGHT_CONFIG_FILE),
+    );
     rebaseBuildOutput({
       outputDir: join(staging, ".output"),
       buildRoot: staging,

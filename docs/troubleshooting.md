@@ -2,6 +2,24 @@
 
 Every entry below is a real failure someone hit, and the fix that shipped. Find your symptom, run the command. Env-var details live in [configuration.md](configuration.md); the full command reference in [cli.md](cli.md).
 
+## Send the maintainer a log package
+
+One line on the server, nothing else to type:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/diagnose.sh | bash
+```
+
+It runs `iva diagnose` (on Iva older than 0.4.1 it collects the service journal instead), cuts the secrets, and sends the package as a file into your chat with the bot. Forward that file to whoever is helping you.
+
+Tokens run out too fast, or turns fail with a provider limit or `Bad Request`: send the usage package instead.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/diagnose-usage.sh | bash
+```
+
+It packs the last three days (`IVA_DIAG_DAYS=7` for a week): tokens of every model step, the skeleton of every turn (model, why each step ended, tool names, which calls failed, steps with neither a tool call nor text) with a `summary.txt` on top, Iva's trace and the failure lines of the service journal. No chat text, no tool inputs or outputs and no `.env` values beyond the model settings leave the server. It goes to your chat with the bot as a `.tgz`; forward it.
+
 ## Common issues
 
 ### Build killed / exit 137
@@ -45,6 +63,8 @@ Cause: a wedged turn lives in `.workflow-data`, and eve re-enqueues it on every 
 
 If Iva reports `Model produced no output for 90s`, the provider stream stayed silent; retry, or switch the model.
 
+For chat turns, transient failures before the provider stream opens get at most three model-call attempts, with default waits of 5s and 15s. Provider Retry-After minimums share that 20s total wait allowance; a longer required wait parks the turn instead of retrying early. Stopping the turn cancels the request and any wait. Transport retries stop once a stream opens; after retry exhaustion the session accepts your next message.
+
 ```bash
 iva reset   # stop services, quarantine workflow + Telegram busy/queue state, restart
 ```
@@ -52,6 +72,8 @@ iva reset   # stop services, quarantine workflow + Telegram busy/queue state, re
 From Telegram, `/new` resets only the current chat or forum topic. `/restart` resets that same session and then restarts the agent process. Both are handled out-of-band and work while the agent is busy. Use server-side `iva reset` only when the entire workflow store is damaged.
 
 After upgrading a legacy group with no recorded Eve token, send `/new` as a reply to Iva's latest message once. Future resets use the exact token stored by the new channel events.
+
+When the ⏹ Stop button does not stop the turn within a minute, the owner's private chat gets the honest text (`The turn hasn't stopped within 60s.`; Russian installations show `Ход не остановился за 60 с.`) and a `Restart Iva` button. That button is the only thing that restarts the agent: it kills work in every chat, so press it only when the turn is really wedged. It stays valid for that same turn until the stale-run reaper drops the record (about 30 minutes) — a press after that answers `This turn is over already.` and changes nothing. Groups get the honest text without the button.
 
 The notice `The conversation grew large, so I started a fresh one. Memory is intact.` means replay exceeded 30 seconds; with a retained first-turn baseline, replay also grew to more than twice that turn. Russian installations show `Диалог разросся, начала новый. Память на месте.` Iva finishes the current turn before resetting only that chat. Vault memory remains intact. Send the next message normally. For a smoke test, set `TELEGRAM_REPLAY_RETIRE_THRESHOLD_MS` to a positive number of milliseconds.
 
@@ -99,7 +121,7 @@ Cause: exactly five names are accepted — `ollama`, `opencode`, `codex`, `openr
 
 ```bash
 journalctl --user -u iva.service -n 20 --no-pager
-# Error: Invalid MODEL_PROVIDER "ollmaa"; expected one of: ollama, opencode, codex, openrouter, custom — run: iva config
+# Error: Invalid MODEL_PROVIDER "ollmaa"; expected one of: ollama, opencode, codex, claude, openrouter, custom — run: iva config
 ```
 
 `iva doctor` prints the same line, and the bridge is a separate service, so `/menu` → 📊 Status still answers and shows the provider as `invalid (ollmaa)`. Fix it with `iva config`, with the `/model` wizard in Telegram, or by hand — then `iva restart`. Removing the variable altogether is not a typo: that still means `ollama`.
@@ -118,28 +140,13 @@ ffmpeg -i note.m4a -f segment -segment_time 600 -c copy part%02d.m4a
 
 ### iva update fails after force-push
 
-Cause: old versions used a destructive recovery path when upstream history changed. Re-run the current installer; it creates a backup ref, stashes tracked and untracked customizations by exact OID, and refuses an unsafe merge:
+Cause: old versions used a destructive recovery path when upstream history changed. Run the repair command; it puts the checkout back onto its release — edits to Iva's own code are removed, `.env`, `data/` and the vault are not touched — and hands the rest to the one updater:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/repair.sh | bash
 ```
 
-Do not reset or clean the checkout. If the histories cannot be combined safely, the existing version and user files remain in place and the full reason is recorded under `data/logs/`.
-
-### Update says "local commits conflict with the update"
-
-Cause: the checkout in `~/iva` carries commits of your own (hand edits, agent-made changes) that no longer merge with upstream. `/update` refuses rather than guess.
-
-Return the code to upstream while keeping your memory and settings. The vault, `.env` and `data/` are not touched; your commits stay on a backup branch:
-
-```bash
-cd ~/iva
-git branch backup-my-changes
-git reset --hard origin/main
-iva update
-```
-
-Afterwards ask Iva to bring back what you still need from `backup-my-changes`, one change at a time. If turns still hang after that, `iva reset` clears the stuck session state (memory stays intact). There is no menu button for this on purpose: the button would live inside the process it resets, and a conflict needs a person to decide what to keep.
+The installer command does the same thing over an existing installation: it hands it to that updater instead of updating anything itself. If the update cannot finish, the version that was running stays in place and the full reason is recorded under `data/logs/`.
 
 ### Update says my version is too old
 
@@ -151,7 +158,7 @@ Reinstall from the current tree — one command, and it is the only way out:
 curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/repair.sh | bash
 ```
 
-Your data and `.env` stay in place: `.env`, `data/`, `vault/` and `attachments/` are copied byte for byte, and the whole old installation is kept beside the new one as `~/iva-backup-<timestamp>`.
+Your data and `.env` stay in place: nothing outside Iva's own code is touched. What the command does touch is that code - it puts the checkout back on the release it tracks, so local edits to Iva's files are removed - and then runs the ordinary update.
 
 ### gh not available warnings
 

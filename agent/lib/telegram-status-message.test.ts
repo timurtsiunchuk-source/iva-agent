@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -9,6 +9,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 // на загрузке модуля, поэтому окружение выставляем до импорта.
 const dataDir = mkdtempSync(join(tmpdir(), "iva-telegram-status-"));
 process.env.ASSISTANT_DATA_DIR = dataDir;
+writeFileSync(
+  join(dataDir, "settings.json"),
+  JSON.stringify({ menuStyle: "rich" }),
+);
 process.env.AGENT_LANGUAGE = "en";
 const load = <T>(name: string): Promise<T> =>
   import(
@@ -21,6 +25,16 @@ const runStatus =
   await load<typeof import("./run-status.ts")>("./run-status.ts");
 
 type Call = { method: string; body: Record<string, unknown> };
+
+// Markdown из тела rich-вызова: и статус, и правки несут его в rich_message.
+const markdownOf = (call: Call): string =>
+  String(
+    (call.body.rich_message as { markdown?: unknown } | undefined)?.markdown,
+  );
+
+// Кнопка inline в той же строке, что и loader (решение владельца 22.09.2026).
+const STOP_BUTTON =
+  '<tg-button type="callback_data" style="danger" data="iva_cancel">⏹</tg-button>';
 
 function handle(
   reply: (
@@ -45,25 +59,85 @@ function handle(
   };
 }
 
-await test("статус уходит анимированным эмодзи и несёт кнопку «Стоп»", async () => {
+await test("статус уходит rich-сообщением с кнопкой «Стоп» в строке текста", async () => {
   const { calls, tg } = handle();
 
   assert.equal(await status.sendWorkingStatus(tg), 500);
   assert.equal(calls.length, 1);
-  assert.ok(Array.isArray(calls[0].body.entities));
-  assert.deepEqual(calls[0].body.reply_markup, status.stopReplyMarkup());
+  assert.equal(calls[0].method, "sendRichMessage");
+  assert.equal(calls[0].body.disable_notification, true);
+  const markdown = markdownOf(calls[0]);
+  assert.equal(
+    markdown,
+    `<tg-emoji emoji-id="5818797194127346654">💬</tg-emoji> ${STOP_BUTTON}`,
+  );
+  assert.equal(markdown.includes("<tg-button-row>"), false);
+  assert.equal(calls[0].body.reply_markup, undefined);
+});
+
+await test("статус и добавление кнопки не зависят от стиля меню", async () => {
+  const results: { direct: Call[]; early: Call[] }[] = [];
+  const settingsPath = join(dataDir, "settings.json");
+  for (const style of ["classic", "rich", null]) {
+    if (style === null) rmSync(settingsPath, { force: true });
+    else writeFileSync(settingsPath, JSON.stringify({ menuStyle: style }));
+    const direct = handle();
+    assert.equal(await status.sendWorkingStatus(direct.tg), 500);
+    const early = handle();
+    assert.equal(
+      await status.sendWorkingStatus(early.tg, { canStop: false }),
+      500,
+    );
+    await status.enableWorkingStatusStop(early.tg, 500);
+    results.push({ direct: direct.calls, early: early.calls });
+  }
+  writeFileSync(settingsPath, JSON.stringify({ menuStyle: "rich" }));
+  assert.deepEqual(results[0], results[1]);
+  assert.deepEqual(results[1], results[2]);
+  for (const { direct, early } of results) {
+    assert.deepEqual(
+      direct.map((call) => call.method),
+      ["sendRichMessage"],
+    );
+    assert.equal(
+      markdownOf(direct[0]),
+      '<tg-emoji emoji-id="5818797194127346654">💬</tg-emoji> ' + STOP_BUTTON,
+    );
+    assert.equal(direct[0].body.reply_markup, undefined);
+    assert.deepEqual(
+      early.map((call) => call.method),
+      ["sendRichMessage", "editMessageText"],
+    );
+    assert.equal(
+      markdownOf(early[0]),
+      '<tg-emoji emoji-id="5818797194127346654">💬</tg-emoji>',
+    );
+    assert.equal(
+      markdownOf(early[1]),
+      '<tg-emoji emoji-id="5818797194127346654">💬</tg-emoji> ' + STOP_BUTTON,
+    );
+    assert.equal(early[0].body.reply_markup, undefined);
+    assert.equal(early[1].body.reply_markup, undefined);
+  }
 });
 
 await test("отказ Telegram на custom_emoji роняет лоадер на ⏳ навсегда", async () => {
   const rejectCustom = handle((call, index) =>
-    index === 0 && call.body.entities
+    index === 0 && markdownOf(call).includes("tg-emoji")
       ? { ok: false, body: { description: "Bad Request: custom emoji" } }
       : { ok: true, body: { result: { message_id: 501 } } },
   );
 
   assert.equal(await status.sendWorkingStatus(rejectCustom.tg), 501);
   assert.equal(rejectCustom.calls.length, 2);
-  assert.match(String(rejectCustom.calls[1].body.text), /^⏳ /u);
+  assert.deepEqual(
+    rejectCustom.calls.map((call) => call.body.disable_notification),
+    [true, true],
+  );
+  // Кнопка живёт в тексте, поэтому падение анимации её не снимает.
+  const fallbackMarkdown = markdownOf(rejectCustom.calls[1]);
+  assert.equal(fallbackMarkdown, `⏳ ${STOP_BUTTON}`);
+  assert.equal(fallbackMarkdown.includes("<tg-button-row>"), false);
 
   const next = handle();
   assert.equal(
@@ -71,8 +145,7 @@ await test("отказ Telegram на custom_emoji роняет лоадер на
     500,
   );
   assert.equal(next.calls.length, 1);
-  assert.equal(next.calls[0].body.entities, undefined);
-  assert.equal(next.calls[0].body.reply_markup, undefined);
+  assert.match(markdownOf(next.calls[0]), /^⏳$/u);
 });
 
 await test("вне лички кнопку «Стоп» не показываем и не дорисовываем", async () => {
@@ -83,7 +156,7 @@ await test("вне лички кнопку «Стоп» не показывае�
 
   assert.equal(await status.sendWorkingStatus(groupTg), 500);
   assert.equal(supergroup.calls.length, 1);
-  assert.equal(supergroup.calls[0].body.reply_markup, undefined);
+  assert.equal(markdownOf(supergroup.calls[0]).includes("<tg-button"), false);
 
   await status.enableWorkingStatusStop(groupTg, 500);
   assert.equal(supergroup.calls.length, 1);
@@ -96,15 +169,17 @@ await test("вне лички кнопку «Стоп» не показывае�
     500,
   );
   assert.equal(proactive.calls.length, 1);
-  assert.equal(proactive.calls[0].body.reply_markup, undefined);
+  assert.equal(markdownOf(proactive.calls[0]).includes("<tg-button"), false);
 
-  // В личке правило прежнее: кнопка и в статусе, и в дорисовке.
+  // В личке правило прежнее: кнопка и в статусе, и в дорисовке — она часть текста,
+  // поэтому кнопку дорисовывает editMessageText, а не editMessageReplyMarkup.
   const direct = handle();
   assert.equal(await status.sendWorkingStatus(direct.tg), 500);
-  assert.deepEqual(direct.calls[0].body.reply_markup, status.stopReplyMarkup());
+  assert.ok(markdownOf(direct.calls[0]).endsWith(STOP_BUTTON));
   await status.enableWorkingStatusStop(direct.tg, 500);
-  assert.equal(direct.calls[1].method, "editMessageReplyMarkup");
-  assert.deepEqual(direct.calls[1].body.reply_markup, status.stopReplyMarkup());
+  assert.equal(direct.calls[1].method, "editMessageText");
+  assert.equal(direct.calls[1].body.message_id, 500);
+  assert.ok(markdownOf(direct.calls[1]).endsWith(STOP_BUTTON));
 });
 
 await test("обычный финал гасит статус и убирает сообщение, повтор — no-op", async () => {
@@ -149,7 +224,8 @@ await test("отмена переписывает статус и оставля
     true,
   );
   assert.equal(calls[0].method, "editMessageText");
-  assert.match(String(calls[0].body.text), /^⏹ Stopped/u);
+  assert.match(markdownOf(calls[0]), /^⏹ Stopped/u);
+  assert.equal(calls[0].body.text, undefined);
   assert.equal(runStatus.getChatStatus(key)?.wasCancelled, true);
 });
 
@@ -220,4 +296,34 @@ await test("своя сессия гасит статус-сообщение", a
   );
   assert.equal(calls[0].body.message_id, 801);
   assert.equal(runStatus.getChatStatus(key)?.status, "idle");
+});
+
+await test("отказ rich оставляет тихий статус с текстом и без кнопки", async () => {
+  const failedRich = handle((call) =>
+    call.method === "sendRichMessage"
+      ? { ok: false, body: { description: "rich unsupported" } }
+      : { ok: true, body: { result: { message_id: 503 } } },
+  );
+  assert.equal(await status.sendWorkingStatus(failedRich.tg), 503);
+  assert.deepEqual(
+    failedRich.calls.map((call) => call.body.disable_notification),
+    [true, true],
+  );
+  assert.deepEqual(
+    failedRich.calls.map((call) => call.method),
+    ["sendRichMessage", "sendMessage"],
+  );
+  assert.equal(failedRich.calls[1].body.text, "⏳ …");
+  assert.equal(failedRich.calls[1].body.reply_markup, undefined);
+
+  writeFileSync(
+    join(dataDir, "settings.json"),
+    JSON.stringify({ menuStyle: "classic" }),
+  );
+  const next = handle();
+  assert.equal(await status.sendWorkingStatus(next.tg), 500);
+  assert.equal(next.calls[0].method, "sendMessage");
+  assert.equal(next.calls[0].body.text, "⏳ …");
+  assert.equal(next.calls[0].body.reply_markup, undefined);
+  assert.equal(next.calls[0].body.disable_notification, true);
 });

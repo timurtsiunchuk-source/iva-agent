@@ -45,9 +45,11 @@ export const TOKEN_URL = `${ISSUER}/oauth/token`;
 export const ORIGINATOR = "codex_cli_rs";
 // Для ?client_version= у /models и User-Agent. ВАЖНО: /models гейтит список по версии —
 // слишком старая (напр. 0.20/0.42) → бэкенд отдаёт {"models":[]}, а модель прячется, если её
-// minimal_client_version выше нашей (напр. gpt-5.6-* требуют ≥0.144.0). Держим на актуальном релизе
-// codex, иначе свежие модели не появятся в списке. Проверено: 0.144.0 отдаёт gpt-5.6-{sol,terra,luna}.
-export const CLIENT_VERSION = "0.144.0";
+// minimal_client_version выше нашей (напр. gpt-6-sol и gpt-6-luna требуют ≥0.155.0). Держим на
+// актуальном релизе codex, иначе свежие модели не появятся в списке. Проверено 2026-09-23: 0.144.0
+// отдаёт только gpt-5.6-*, 0.156.0 — ещё gpt-6-{sol,luna,astra}. Проверено 2026-10-03: 0.156.0 не
+// показывает gpt-6.1-sol, хотя его minimal_client_version 0.153.0; 0.159.2 показывает.
+export const CLIENT_VERSION = "0.159.2";
 const REFRESH_SKEW_S = 300; // рефрешим за 5 мин до exp (как окно codex CLI)
 const FORCE_REFRESH_COOLDOWN_MS = 60_000;
 
@@ -121,15 +123,21 @@ export function toAuth(
   prev: Partial<CodexAuth> = {},
 ): CodexAuth {
   const idToken = tokens.id_token || prev.id_token;
-  const { accountId, planType } = idToken
+  // id_token есть, но аккаунта в нём нет (не JWT, нет клейма, пустой клейм) — прежние
+  // accountId и planType остаются: без заголовка ChatGPT-Account-ID бэкенд подписки
+  // отвечает отказом, а рефреш сам себя не чинит (слепое QA v3). Новый id_token,
+  // НАЗВАВШИЙ аккаунт, по-прежнему побеждает: так переезжают на другой.
+  const named = idToken
     ? accountFromIdToken(idToken)
-    : { accountId: prev.accountId, planType: prev.planType };
+    : { accountId: null, planType: null };
   return {
     id_token: idToken,
-    access_token: tokens.access_token,
+    // Пустой ответ не смеет стереть уже записанный токен: файл входа обновляется только
+    // на непустое значение (PBT-DS1-P F2).
+    access_token: tokens.access_token || prev.access_token || "",
     refresh_token: tokens.refresh_token || prev.refresh_token,
-    accountId: accountId as string | null,
-    planType: planType as string | null,
+    accountId: named.accountId ?? prev.accountId ?? null,
+    planType: named.planType ?? prev.planType ?? null,
   };
 }
 
@@ -149,7 +157,18 @@ async function refresh(
     throw new Error(
       `token refresh failed: ${res.status} ${(await res.text()).slice(0, 300)}`,
     );
-  return (await res.json()) as TokenResponse; // { id_token?, access_token, refresh_token? }
+  const body = (await res.json()) as TokenResponse; // { id_token?, access_token, refresh_token? }
+  // Ответ без access_token — ОТКАЗ обновления, а не новый вход: записать его значит
+  // стереть рабочий файл входа, потребовать `iva login` на следующем вызове и отправить
+  // провайдеру заголовок "Bearer undefined" (PBT-DS1-P F2). Пустая строка — такой же
+  // отказ: заголовок без токена не работает.
+  const accessToken =
+    typeof body?.access_token === "string" ? body.access_token.trim() : "";
+  if (!accessToken)
+    throw new Error(
+      "token refresh returned no access_token; the stored login was kept — run `iva login` if this repeats",
+    );
+  return { ...body, access_token: accessToken };
 }
 
 // ── getAccessToken: свежий токен для каждого запроса ────────────────────────

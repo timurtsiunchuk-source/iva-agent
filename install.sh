@@ -24,6 +24,11 @@ printf '\n  \033[36m⏳ Preparing environment / Идёт подготовка о
 set -Eeuo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/smixs/iva-agent.git}"
+# IVA_BETA=1 - бета-обновления: всегда ветка beta, в main только выпуски (ADR-0018).
+if [ "${IVA_BETA:-}" = 1 ]; then
+  [ "${BRANCH:-beta}" = beta ] || printf 'IVA_BETA=1: BRANCH=%s ignored, installing the beta branch\n' "$BRANCH" >&2
+  BRANCH=beta
+fi
 BRANCH="${BRANCH:-main}"
 UPDATE_CHANNEL="$BRANCH"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/iva}"
@@ -112,6 +117,7 @@ download_verified() {
 
 install_verified_npm_tarball() {
   local label="$1" url="$2" expected="$3" rc=0
+  shift 3
   if download_verified "$label" "$url" "$expected"; then
     :
   else
@@ -119,7 +125,7 @@ install_verified_npm_tarball() {
     cleanup_verified_download
     return "$rc"
   fi
-  if npm i -g "$VERIFIED_DOWNLOAD"; then rc=0; else rc=$?; fi
+  if npm i -g "$@" "$VERIFIED_DOWNLOAD"; then rc=0; else rc=$?; fi
   cleanup_verified_download
   return "$rc"
 }
@@ -224,31 +230,32 @@ IVA_TREE
   echo
 }
 
-# A re-run over an existing checkout uses the same preservation contract as
-# `iva update`: exact stash OID, backup ref, no git clean and no reset to remote.
+# What this run replaces and has to be able to put back: the copy of .env and the build it
+# overwrites. The checkout itself is never moved by this script - an installation that
+# already exists is handed to the one updater (hand_installation_to_repair below).
 # Declared before the traps, because the exit handler reads them on every path out.
 INSTALL_UPDATE_ACTIVE=false
 INSTALL_COMPLETE=false
-INSTALL_ORIGINAL_HEAD=""
-INSTALL_STASH_OID=""
-INSTALL_BACKUP_REF=""
 INSTALL_ENV_BACKUP=""
 INSTALL_OUTPUT_BACKUP=""
-INSTALL_UNTRACKED_LIST=""
 INSTALL_LOCK=""
 INSTALL_DATA=""
-# Set once the checkout is known to hold the user's own state again — after a clean
-# rollback, or after a finished install. Only then are the stash entry and the backup
-# ref duplicates that may be dropped.
+# Set once the installation is known to hold the user's own state again — after a clean
+# rollback, or after a finished install. Only then are the copies this run made duplicates
+# that may be dropped.
 INSTALL_TREE_RESTORED=false
 
-# Two installers in one checkout undo each other: the second stashes what the first is
-# still building from, and both restore over each other's work. A directory is the lock,
+# Two installers in one tree undo each other: the second replaces the build the first is
+# still writing, and both restore over each other's work. A directory is the lock,
 # because creating one is atomic everywhere. A lock whose owner is gone is taken over -
 # a run killed by a power cut must not leave the installation unusable.
 acquire_install_lock() {
   local lock owner=""
-  INSTALL_DATA="$(
+  # Путь замка обязан быть одним для всех, кто бежит над этим деревом: передача
+  # обновлятору получает его явно, потому что старый чекаут может не уметь ответить,
+  # где его data, а после ремонта ответил бы уже иначе.
+  INSTALL_DATA="${1:-}"
+  [ -n "$INSTALL_DATA" ] || INSTALL_DATA="$(
     cd "$PROJECT_DIR"
     node --input-type=module -e '
 import { loadEnvFile } from "node:process";
@@ -259,8 +266,11 @@ delete process.env.ASSISTANT_DATA_DIR;
 try { loadEnvFile(join(root, ".env")); }
 catch (cause) { if (cause?.code !== "ENOENT") throw cause; }
 process.stdout.write(resolveDataDir(root, process.env.ASSISTANT_DATA_DIR));
-' "$PROJECT_DIR"
-  )"
+' "$PROJECT_DIR" 2>/dev/null
+  )" || INSTALL_DATA=""
+  # Старый или оборванный чекаут может не иметь этого модуля - именно его сюда и
+  # привели чинить. Замок тогда стоит на каталоге по умолчанию, а не валит ремонт.
+  [ -n "$INSTALL_DATA" ] || INSTALL_DATA="$PROJECT_DIR/data"
   lock="$INSTALL_DATA/install.lock"
   mkdir -p "$INSTALL_DATA" 2>/dev/null || true
   if ! mkdir "$lock" 2>/dev/null; then
@@ -287,25 +297,26 @@ process.stdout.write(resolveDataDir(root, process.env.ASSISTANT_DATA_DIR));
   printf '%s\n' "$$" >"$lock/pid" 2>/dev/null || true
 }
 
-# Copies .env with the permissions it must have from the first byte: `cp -p` carries the
-# source mode over, and a .env somebody left world-readable would be copied that way and
-# stay so until the chmod — a window a shared box does not need. The copy appears at its
-# final name only once it is whole, so a rollback can never restore half a file over a
-# whole one.
+# Copies .env with the permissions it must have from the first byte: the part file is
+# created under umask 077, so even the empty file that appears first is already 600. The
+# chmod stays for a part left behind by a run of an older version, which could be 644.
+# `cp -p` would have carried the source mode over, and a .env somebody left world-readable
+# would be copied that way and stay so until the chmod — a window a shared box does not
+# need. The copy appears at its final name only once it is whole, so a rollback can never
+# restore half a file over a whole one.
 copy_env_private() {
   local part="$1.part"
-  : >"$part" 2>/dev/null || return 1
+  (umask 077; : >"$part") 2>/dev/null || return 1
   chmod 600 "$part" 2>/dev/null || { rm -f -- "$part"; return 1; }
   cat "$PROJECT_DIR/.env" >"$part" 2>/dev/null || { rm -f -- "$part"; return 1; }
   mv -- "$part" "$1"
 }
 
-# Saves whatever this run is about to overwrite. `moving` is for the one path that also
-# rewrites the checkout itself (fetch and merge): only there does HEAD move, and only there
-# is a stash needed to make room for it. Every path gets the copy of .env and, from here
-# on, the backup of .output the build replaces.
-prepare_install_update() {
-  local moving="${1:-}" stamp backups
+# Saves what this run is about to overwrite: the copy of .env, and from here on the backup
+# of the .output the build replaces. Nothing else is this script's to save - the code of an
+# installation that already exists it does not touch at all.
+save_env_copy() {
+  local stamp backups
   # Armed before the first artifact: a failure while preparing must reach the same rollback
   # as any later one, or what it just wrote is orphaned and the cleanup reports changes it
   # never took.
@@ -314,50 +325,27 @@ prepare_install_update() {
 
   # The copies live next to the installation, not in /tmp: `iva update` keeps its own
   # copy of .env in data/update-backups/ for the same reason — a world-readable directory
-  # is no place for the file that holds every key. git ignores data/, so the copies never
-  # reach a stash either.
+  # is no place for the file that holds every key.
   backups="$INSTALL_DATA/update-backups"
   if ! (mkdir -p "$backups" 2>/dev/null && chmod 700 "$backups" 2>/dev/null); then
     backups=""
   fi
-  if [ -f "$PROJECT_DIR/.env" ]; then
-    local candidate
-    if [ -n "$backups" ]; then
-      candidate="$backups/.env-$stamp"
-    else
-      candidate="$(mktemp "${TMPDIR:-/tmp}/iva-env.XXXXXX")"
-    fi
-    # Named only once the copy is whole: a backup nobody could finish must not be one the
-    # rollback trusts. And an install that cannot preserve .env has no business going on to
-    # replace the build. The empty file mktemp already made goes with it, or a run that
-    # never copied anything would leave a stub behind in /tmp.
-    copy_env_private "$candidate" || {
-      rm -f -- "$candidate"
-      die "$(t "Cannot copy $PROJECT_DIR/.env — check its permissions and free space, then run again." "Не могу скопировать $PROJECT_DIR/.env — проверьте права и свободное место, потом запустите снова.")"
-    }
-    INSTALL_ENV_BACKUP="$candidate"
-  fi
-
-  [ "$moving" = moving ] || return 0
-
-  INSTALL_ORIGINAL_HEAD="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
-  INSTALL_BACKUP_REF="refs/iva/update-backups/$stamp"
-  git -C "$PROJECT_DIR" update-ref "$INSTALL_BACKUP_REF" "$INSTALL_ORIGINAL_HEAD"
+  [ -f "$PROJECT_DIR/.env" ] || return 0
+  local candidate
   if [ -n "$backups" ]; then
-    INSTALL_UNTRACKED_LIST="$backups/untracked-$stamp.zlist"
+    candidate="$backups/.env-$stamp"
   else
-    INSTALL_UNTRACKED_LIST="$(mktemp "${TMPDIR:-/tmp}/iva-untracked.XXXXXX")"
+    candidate="$(mktemp "${TMPDIR:-/tmp}/iva-env.XXXXXX")"
   fi
-  git -C "$PROJECT_DIR" ls-files --others --exclude-standard -z >"$INSTALL_UNTRACKED_LIST"
-  if [ -n "$(git -C "$PROJECT_DIR" status --porcelain=v1 --untracked-files=all)" ]; then
-    git -C "$PROJECT_DIR" stash push --include-untracked --message "iva-install-$stamp" >>"$INSTALL_LOG" 2>&1
-    INSTALL_STASH_OID="$(git -C "$PROJECT_DIR" rev-parse refs/stash)"
-  fi
-}
-
-restore_install_stash() {
-  [ -n "$INSTALL_STASH_OID" ] || return 0
-  git -C "$PROJECT_DIR" stash apply --index "$INSTALL_STASH_OID" >>"$INSTALL_LOG" 2>&1
+  # Named only once the copy is whole: a backup nobody could finish must not be one the
+  # rollback trusts. And an install that cannot preserve .env has no business going on to
+  # replace the build. The empty file mktemp already made goes with it, or a run that
+  # never copied anything would leave a stub behind in /tmp.
+  copy_env_private "$candidate" || {
+    rm -f -- "$candidate"
+    die "$(t "Cannot copy $PROJECT_DIR/.env — check its permissions and free space, then run again." "Не могу скопировать $PROJECT_DIR/.env — проверьте права и свободное место, потом запустите снова.")"
+  }
+  INSTALL_ENV_BACKUP="$candidate"
 }
 
 rollback_install_update() {
@@ -365,30 +353,6 @@ rollback_install_update() {
   INSTALL_UPDATE_ACTIVE=false
   set +e
   local restored=true
-  git -C "$PROJECT_DIR" rebase --abort >>"$INSTALL_LOG" 2>&1
-  # Both resets go to the user's recorded HEAD, never to upstream. Which one is safe
-  # depends on where their work is: with a stash the tree is a copy of what the stash
-  # holds, so it may be thrown away; without one the tree is the only place their changes
-  # exist, and --keep refuses to overwrite a modified file instead of destroying it.
-  # No recorded head at all means this run never moved the checkout — only the build and
-  # .env are its to put back.
-  if [ -z "$INSTALL_ORIGINAL_HEAD" ]; then
-    :
-  elif [ -n "$INSTALL_STASH_OID" ]; then
-    git -C "$PROJECT_DIR" reset --hard "$INSTALL_ORIGINAL_HEAD" >>"$INSTALL_LOG" 2>&1 || restored=false
-  else
-    git -C "$PROJECT_DIR" reset --keep "$INSTALL_ORIGINAL_HEAD" >>"$INSTALL_LOG" 2>&1 || restored=false
-  fi
-  # Only ever to make room for the stash that holds these same files. Without a stash there
-  # is nothing to put them back from, and a rollback that deletes the user's untracked work
-  # is worse than the failure it is undoing.
-  if [ -n "$INSTALL_STASH_OID" ] && [ -n "$INSTALL_UNTRACKED_LIST" ] \
-    && [ -f "$INSTALL_UNTRACKED_LIST" ]; then
-    while IFS= read -r -d '' relative; do
-      rm -f -- "$PROJECT_DIR/$relative"
-    done <"$INSTALL_UNTRACKED_LIST"
-  fi
-  restore_install_stash || restored=false
   if [ -n "$INSTALL_ENV_BACKUP" ] && [ -f "$INSTALL_ENV_BACKUP" ]; then
     if cat "$INSTALL_ENV_BACKUP" >"$PROJECT_DIR/.env"; then
       chmod 600 "$PROJECT_DIR/.env"
@@ -411,36 +375,20 @@ rollback_install_update() {
 }
 
 # Removes what this run created, on success and on failure alike. Called last, so a
-# rollback has already read the copies back into the checkout. The stash entry and the
-# backup ref are dropped only once the checkout holds the user's state again; if the
-# rollback could not finish, they stay and are named, because a recoverable mess beats
-# lost work.
+# rollback has already read the copies back into the installation. They are dropped only
+# once it holds the user's state again; if the rollback could not finish, they stay and are
+# named, because a recoverable mess beats lost work.
 cleanup_install_artifacts() {
   set +e
   cleanup_verified_download
-  # The list of names is never the only copy of anything.
-  [ -z "$INSTALL_UNTRACKED_LIST" ] || rm -f -- "$INSTALL_UNTRACKED_LIST"
-  INSTALL_UNTRACKED_LIST=""
   if [ "$INSTALL_TREE_RESTORED" = true ]; then
     [ -z "$INSTALL_ENV_BACKUP" ] || rm -f -- "$INSTALL_ENV_BACKUP"
     INSTALL_ENV_BACKUP=""
     [ -z "$INSTALL_OUTPUT_BACKUP" ] || rm -rf -- "$INSTALL_OUTPUT_BACKUP"
     INSTALL_OUTPUT_BACKUP=""
-    if [ -n "$INSTALL_STASH_OID" ]; then
-      local stash_ref
-      stash_ref="$(git -C "$PROJECT_DIR" stash list --format='%gd %H' | awk -v oid="$INSTALL_STASH_OID" '$2 == oid {print $1; exit}')"
-      [ -z "$stash_ref" ] || git -C "$PROJECT_DIR" stash drop "$stash_ref" >>"$INSTALL_LOG" 2>&1
-      INSTALL_STASH_OID=""
-    fi
-    if [ -n "$INSTALL_BACKUP_REF" ]; then
-      git -C "$PROJECT_DIR" update-ref -d "$INSTALL_BACKUP_REF" >>"$INSTALL_LOG" 2>&1
-      INSTALL_BACKUP_REF=""
-    fi
   else
-    # Nothing this run saved is removed while the checkout is not back to what it was:
+    # Nothing this run saved is removed while the installation is not back to what it was:
     # each of these may be the only copy left, so they are kept and named instead.
-    [ -z "$INSTALL_STASH_OID" ] || warn "$(t "Your changes are in the stash: git stash list" "Ваши изменения в stash: git stash list")"
-    [ -z "$INSTALL_BACKUP_REF" ] || warn "$(t "Your previous commit is kept at $INSTALL_BACKUP_REF" "Прежний коммит сохранён в $INSTALL_BACKUP_REF")"
     [ -z "$INSTALL_ENV_BACKUP" ] || warn "$(t "Your .env is copied at $INSTALL_ENV_BACKUP" "Копия вашего .env: $INSTALL_ENV_BACKUP")"
     [ -z "$INSTALL_OUTPUT_BACKUP" ] || warn "$(t "Your previous build is kept at $INSTALL_OUTPUT_BACKUP" "Прежняя сборка сохранена в $INSTALL_OUTPUT_BACKUP")"
   fi
@@ -452,9 +400,55 @@ cleanup_install_artifacts() {
 finish_install_update() {
   [ "$INSTALL_UPDATE_ACTIVE" = true ] || return 0
   INSTALL_UPDATE_ACTIVE=false
-  # The stash was applied back onto the updated checkout right after the merge.
   INSTALL_TREE_RESTORED=true
   cleanup_install_artifacts
+}
+
+# repair.sh of the channel this installer came from. An installation that is stuck holds a
+# repair.sh of the release it is stuck on, and that is the one file here that must not be
+# old - so it comes from the same REPO_URL and BRANCH as the installer itself.
+repair_script_url() {
+  local repo="${REPO_URL%.git}" path=""
+  case "$repo" in
+    https://github.com/*) path="${repo#https://github.com/}" ;;
+    git@github.com:*) path="${repo#git@github.com:}" ;;
+    ssh://git@github.com/*) path="${repo#ssh://git@github.com/}" ;;
+    *) return 1 ;;
+  esac
+  printf 'https://raw.githubusercontent.com/%s/%s/repair.sh' "$path" "$BRANCH"
+}
+
+# One updater: over an installation that already exists this script updates nothing itself.
+# It hands the tree to repair.sh, which is where `iva update`, the bridge and the repair
+# command all go, and exits with what came back. The installer keeps no second copy of that
+# route - and no second answer to whether a tree may be updated at all.
+# IVA_BETA=1 над существующей установкой: выбор - в зеркало и .git до передачи обновлятору.
+record_beta_choice() {
+  [ "${IVA_BETA:-}" = 1 ] || return 0
+  local repo
+  for repo in "$INSTALL_DIR/repo" "$INSTALL_DIR/.git"; do
+    [ -e "$repo" ] || continue
+    git --git-dir="$repo" config --local iva.updateBranch beta
+    git --git-dir="$repo" config --local iva.beta true
+  done
+}
+
+hand_installation_to_repair() {
+  local url script rc=0
+  url="$(repair_script_url)" || die "$(t "REPO_URL is not a GitHub repository of the project, so there is no repair.sh to update $INSTALL_DIR with: run 'iva update' yourself." "REPO_URL не репозиторий проекта на GitHub, взять repair.sh для обновления $INSTALL_DIR неоткуда: запустите 'iva update' сами.")"
+  cleanup_verified_download
+  VERIFIED_DOWNLOAD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/iva-repair-XXXXXX")" \
+    || die "$(t "Cannot create a temporary directory in ${TMPDIR:-/tmp}" "Не могу создать временный каталог в ${TMPDIR:-/tmp}")"
+  script="$VERIFIED_DOWNLOAD_DIR/repair.sh"
+  VERIFIED_DOWNLOAD="$script"
+  curl -fsSL "$url" -o "$script" \
+    || die "$(t "Couldn't download $url — check the network and run again." "Не удалось скачать $url — проверьте сеть и запустите снова.")"
+  step "$(t "Iva is already installed in $INSTALL_DIR — handing it to the updater" "Iva уже установлена в $INSTALL_DIR — передаю обновлятору")"
+  if IVA_INSTALL_DIR="$INSTALL_DIR" AGENT_LANGUAGE="$IVA_LANG" bash "$script"; then rc=0; else rc=$?; fi
+  # Отменять нечего: дерева этот ход не касался, всю работу сделал обновлятор, и его код
+  # возврата - ответ всей команды.
+  INSTALL_COMPLETE=true
+  exit "$rc"
 }
 
 # Loud error handler: no more silent exits from set -e.
@@ -477,17 +471,17 @@ on_err() {
   } >&2 2>/dev/null || true
 }
 # The single exit path: `die`, errexit, Ctrl-C, a dropped SSH session and SIGTERM all end
-# up here, so no run leaves a copy of .env, a stash entry or a backup ref behind.
+# up here, so no run leaves its copy of .env or of the previous build behind.
 # The rollback is decided by INSTALL_COMPLETE and not by the exit code: the code is right
 # for every route this script traps, but bash enters this handler with $? = 0 for the fatal
 # signals nothing traps, and a run that died on one of those is exactly the one that must
 # put the checkout back.
 finalize_install() {
   local rc=$?
-  # The undo runs commands that fail as a matter of course — `git rebase --abort` with no
-  # rebase in progress is the usual one — and the ERR trap does not care that `set +e` is
-  # on. Left armed it prints a second "Install aborted" over the real cause, which is how
-  # the reason for a failure gets lost.
+  # The undo runs commands that fail as a matter of course — putting the previous build
+  # back onto a read-only or full disk is the usual one — and the ERR trap does not care
+  # that `set +e` is on. Left armed it prints a second "Install aborted" over the real
+  # cause, which is how the reason for a failure gets lost.
   trap - ERR
   # Nothing in here may end the handler early: this is the only path that puts the
   # checkout back, and it runs while something has already gone wrong.
@@ -534,6 +528,13 @@ done
 # Does the terminal actually open? (in a Docker build the /dev/tty node exists, but open gives ENXIO).
 have_tty() { (: < /dev/tty) 2>/dev/null; }
 
+# Один разбор ответа на все вопросы мастера: пробелы по краям и хвостовая пунктуация
+# пункта меню («2.», «2)», «да.») не меняют ответ. Разбор один на все вопросы, чтобы
+# «да» и «2.» понимались одинаково везде.
+answer_token() {
+  printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:].)]*$//'
+}
+
 # y/n question with a default; input source: stdin-tty → /dev/tty → default.
 prompt_yes_no() {
   local question="$1" default="${2:-no}" suffix answer=""
@@ -542,11 +543,16 @@ prompt_yes_no() {
   elif [ "$IS_INTERACTIVE" = true ]; then read -r -p "$question $suffix " answer || answer=""
   elif have_tty; then printf '%s %s ' "$question" "$suffix" > /dev/tty; IFS= read -r answer < /dev/tty || answer=""
   else answer=""; fi
-  answer="$(printf '%s' "$answer" | tr -d '[:space:]')"
+  answer="$(answer_token "$answer")"
   if [ -z "$answer" ]; then
     case "$default" in [yY]*|1|true) return 0 ;; *) return 1 ;; esac
   fi
-  case "$answer" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+  # Явные строки, не диапазоны: на чистой Debian/Ubuntu локаль POSIX, и `[дД]` в case
+  # сравнивает байты — кириллица не совпадает (проверено под LC_ALL=C).
+  case "$answer" in
+    y|Y|yes|Yes|yEs|yeS|YEs|YeS|yES|YES|д|Д|да|Да|дА|ДА) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Language is the VERY FIRST question, before any system work. Bilingual prompt, default English.
@@ -573,8 +579,8 @@ pick_language() {
     elif have_tty; then printf '  > ' > /dev/tty; IFS= read -r ans < /dev/tty || ans=""
     else ans=""; fi
   fi
-  case "$(printf '%s' "$ans" | tr -d '[:space:]')" in
-    2|ru|RU|[Рр]ус*) IVA_LANG=ru ;;
+  case "$(answer_token "$ans")" in
+    2|ru|RU|рус*|Рус*|РУС*|ру|Ру|РУ) IVA_LANG=ru ;;
     1|en|EN) IVA_LANG=en ;;
     *) IVA_LANG="$default_lang" ;;
   esac
@@ -868,8 +874,28 @@ fi
 command -v node >/dev/null 2>&1 || die "$(t "Node $NODE_MAJOR_MIN+ failed to install. Install it manually (nvm install $NODE_MAJOR_MIN) and re-run." "Node $NODE_MAJOR_MIN+ не установился. Поставьте вручную (nvm install $NODE_MAJOR_MIN) и перезапустите.")"
 ok "Node $(node -v)"
 
+# Новая установка и ремонт ставят новейший выпуск (метку vX.Y.Z на ветке, ADR-0017), если
+# он не старше первого выпуска с бета-обновлениями, иначе вершину ветки; IVA_BETA=1 или
+# iva.beta=true — вершину. Ветка остаётся той же: за ней следит обновлятор. Та же функция
+# стоит в install.sh и repair.sh: оба запускаются через curl | bash и самодостаточны.
+checkout_release() {
+  local first="0.4.9" tag target="${3:-HEAD}"
+  if [ "${IVA_BETA:-}" = 1 ]; then git -C "$1" config --local iva.beta true; fi
+  # Бета - ветка beta или прежний флаг (ADR-0018): вершина. Иначе новейший выпуск.
+  if [ "$(git -C "$1" config --local --get iva.beta || true)" != true ] \
+    && [ "$(git -C "$1" config --local --get iva.updateBranch || true)" != beta ]; then
+    tag="$(git -C "$1" tag --list 'v*' --merged "$target" --sort=-v:refname \
+      | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | head -n 1 || true)"
+    if [ -n "$tag" ] && [ "$(printf '%s\n%s\n' "$first" "${tag#v}" | sort -V | head -n 1)" = "$first" ]; then target="$tag"; fi
+  fi
+  # $2 - коммит, стоявший до ремонта: новее цели (её потомок) - он и остаётся.
+  if [ -n "${2:-}" ] && git -C "$1" merge-base --is-ancestor "$target" "$2" 2>/dev/null; then target="$2"; fi
+  git -C "$1" reset -q --hard "$target"
+}
+
 # ─────────────────────────────────────────────────────────────────────────
-# 4. Project code (current directory / update / clone). SCRIPT_DIR is resolved at the top.
+# 4. Project code (current directory / an installation that exists / clone). SCRIPT_DIR is
+#    resolved at the top.
 # ─────────────────────────────────────────────────────────────────────────
 CURRENT_STEP="$(t "reading the installation" "чтение установки")"
 if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/package.json" ] && grep -q '"eve"' "$SCRIPT_DIR/package.json"; then
@@ -881,42 +907,23 @@ if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/package.json" ] && grep -q '"eve"' 
   # No git work here, and the build is destructive all the same: this is the command the
   # installer itself tells people to re-run, so it owes them the same undo as any other.
   CURRENT_STEP="$(t "saving your files" "сохранение ваших файлов")"
-  prepare_install_update
-elif [ -d "$INSTALL_DIR/.git" ]; then
-  PROJECT_DIR="$INSTALL_DIR"
-  acquire_install_lock
-  CURRENT_STEP="$(t "saving your changes" "сохранение ваших изменений")"
-  start_spinner "$(t "Saving your changes" "Сохраняю ваши изменения")"
-  prepare_install_update moving
-  stop_spinner
-  ok "$(t "Changes saved" "Изменения сохранены")"
-  CURRENT_STEP="$(t "getting the update" "получение обновления")"
-  start_spinner "$(t "Getting the update" "Получаю обновление")"
-  if git -C "$PROJECT_DIR" fetch --prune origin "refs/heads/$BRANCH" >>"$INSTALL_LOG" 2>&1; then
-    remote_ref="$(git -C "$PROJECT_DIR" rev-parse FETCH_HEAD)"
-    if git -C "$PROJECT_DIR" merge-base --is-ancestor HEAD "$remote_ref"; then
-      git -C "$PROJECT_DIR" merge --ff-only "$remote_ref" >>"$INSTALL_LOG" 2>&1
-    elif git -C "$PROJECT_DIR" merge-base --is-ancestor "$remote_ref" HEAD; then
-      : # local commits are already ahead; preserve them as-is
-    else
-      git -C "$PROJECT_DIR" rebase "$remote_ref" >>"$INSTALL_LOG" 2>&1
-    fi
-    restore_install_stash
-    stop_spinner
-    ok "$(t "Update received" "Обновление получено")"
-  else
-    stop_spinner
-    rollback_install_update
-    die "$(t "Couldn't safely combine the update; the previous checkout was restored." "Не удалось безопасно объединить обновление; прежнее состояние восстановлено.")"
-  fi
-elif [ -d "$INSTALL_DIR/versions" ]; then
-  # A versioned installation has no checkout to update and no room for a clone: the
-  # code lives in $INSTALL_DIR/versions/<version> behind the `current` symlink, and
-  # only `iva update` may add one. Same refusal as repair.sh.
-  die "$(t "$INSTALL_DIR already runs versioned installs: update it with 'iva update', or return to the previous version with 'iva rollback'." "$INSTALL_DIR уже работает на версионной раскладке: обновляйте командой 'iva update' или вернитесь на прошлую версию через 'iva rollback'.")"
+  save_env_copy
+elif [ -d "$INSTALL_DIR/.git" ] || [ -d "$INSTALL_DIR/versions" ]; then
+  # Iva уже установлена: обновлять её установщик не имеет права - обновлятор один.
+  # Куда идти с этим деревом, решает repair.sh того же канала: маркер `.iva-dev` -
+  # отказ, версионная раскладка - её собственный обновлятор, чекаут - назад на релиз и
+  # потом обновление. Своей копии этого решения у установщика нет.
+  CURRENT_STEP="$(t "handing the installation to the updater" "передача установки обновлятору")"
+  # Чекаут ниже двигает git: второй установщик над тем же деревом получал бы сырой
+  # «index.lock: File exists» вместо отказа по имени. Версионную раскладку сторожит замок
+  # самого обновлятора.
+  if [ -d "$INSTALL_DIR/.git" ]; then PROJECT_DIR="$INSTALL_DIR"; acquire_install_lock "$INSTALL_DIR/data"; fi
+  record_beta_choice
+  hand_installation_to_repair
 else
   run_stage "$(t "Cloning Iva" "Клонирую Iva")" "$(t "Iva downloaded" "Iva загружена")" \
     git clone --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
+  checkout_release "$INSTALL_DIR"
   PROJECT_DIR="$INSTALL_DIR"
   acquire_install_lock
 fi
@@ -970,7 +977,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────────
 # The binary installs into npm-global; the path is needed here and in the service PATH (below).
 NPM_GLOBAL_BIN="$(npm prefix -g 2>/dev/null)/bin"
-export PATH="$NPM_GLOBAL_BIN:$PATH"
+export PATH="$HOME/.local/bin:$NPM_GLOBAL_BIN:$PATH"
 CURRENT_STEP="agent-browser"
 # The launch check first, not after the install: it is the same proof the install path
 # ends with, and passing it means the binary and Chromium are both there. Downloading
@@ -1013,10 +1020,9 @@ fi
 # ─────────────────────────────────────────────────────────────────────────
 # 5c. Google Workspace CLI (`gws`): Gmail / Calendar / Drive / Sheets / Docs
 # ─────────────────────────────────────────────────────────────────────────
-# Installed once and left alone: an installed `gws` is kept current by `iva update`
-# (scripts/cli/update.ts runs the same global install), so re-running the installer after
-# a failure has no reason to pay for it again. Non-fatal — Google-service tasks are
-# optional. Binary lands in npm-global (already on PATH). Auth is per-user and
+# Installed once and left alone: an installed `gws` is kept current by `iva update`,
+# so re-running the installer after a failure has no reason to pay for it again. Non-fatal — Google-service tasks are
+# optional. Binary lands in ~/.local/bin (first on the service PATH). Auth is per-user and
 # interactive — the bot walks the user through it in chat (agent skill
 # `google-workspace`); nothing to configure here.
 CURRENT_STEP="gws"
@@ -1025,7 +1031,7 @@ if command -v gws >/dev/null 2>&1; then
 else
   gws_rc=0
   if run_stage "$(t "Installing Google Workspace CLI" "Ставлю Google Workspace CLI")" "$(t "gws installed" "gws установлен")" \
-    install_verified_npm_tarball gws "$GWS_TARBALL_URL" "$GWS_TARBALL_SHA256" \
+    install_verified_npm_tarball gws "$GWS_TARBALL_URL" "$GWS_TARBALL_SHA256" --prefix "$HOME/.local" \
     && command -v gws >/dev/null 2>&1; then
     ok "$(t "gws ready — connect Google later: message the bot \"connect Google\"" "gws готов — Google подключишь позже: напиши боту «подключи Google»")"
   else

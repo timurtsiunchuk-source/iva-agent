@@ -1,6 +1,6 @@
 ---
 name: documents
-description: Use for every local PDF, DOCX, or XLSX attachment or path. Any mention of a .pdf, .docx, or .xlsx filename is a trigger, including a Telegram file or a simple read, summary, search, answer, extraction, or vault import. Load this required document capability before generic file-reading tools. Do not use for Google Docs or Sheets opened through Google Workspace, ordinary text messages, or standalone image files.
+description: "Local PDF, DOCX, XLSX file/attachment: read, summarize, extract, import; not Google Docs; before generic file tools."
 ---
 
 # Documents
@@ -24,7 +24,7 @@ stat --printf='%s bytes\n' "$input"
 file --brief --mime-type "$input"
 ```
 
-Поддерживаются PDF, DOCX и XLSX. Для другого формата честно назови ограничение. Не запускай
+Скилл покрывает PDF, DOCX и XLSX. Не запускай
 обработку неожиданно большого файла без подтверждения пользователя. Каждый вызов `bash` уже
 ограничен runtime-таймаутом Iva в 120 секунд; не увеличивай его для документа молча.
 
@@ -49,7 +49,7 @@ pdftotext -layout "$input" "$tmp_text" || { rm -f "$tmp_text"; exit 1; }
 ```
 
 Если результат пуст или содержит только служебные символы, это PDF-скан без текстового слоя.
-Скажи, что в Iva нет OCR для таких PDF, и не выдумывай содержимое.
+Текста в нём нет: не выдумывай содержимое.
 
 ### DOCX
 

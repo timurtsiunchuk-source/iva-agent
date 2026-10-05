@@ -22,7 +22,7 @@ interface PreferenceCandidate {
 // и для сторожа, который сравнивает файл до и после ночного хода.
 const HEADING = /^##[ \t]+(.+?)[ \t]*$/u;
 
-const SECTION_KIND = new Map<string, Section>([
+export const SECTION_KIND = new Map<string, Section>([
   ["Пользователь", "user"],
   ["User", "user"],
   ["Предпочтения", "preferences"],
@@ -184,13 +184,18 @@ export function clampCore(text: string): string {
   classifySections(lines);
   enforceGoalLimit(lines);
 
-  let current = render(lines);
+  const current = render(lines);
   if (current.length <= CORE_CAP) return current;
 
+  // Длину ведём вычитанием: render() на каждую вытесняемую строку делал сжатие
+  // квадратичным (4× вход ≈ 15× времени), а clampCore зовётся на каждом ходу,
+  // пока CORE больше потолка.
+  let length = current.length;
   for (const item of preferenceEvictionOrder(lines)) {
+    if (item.line.removed) continue;
     item.line.removed = true;
-    current = render(lines);
-    if (current.length <= CORE_CAP) return current;
+    length -= item.line.content.length + item.line.ending.length;
+    if (length <= CORE_CAP) return render(lines);
   }
 
   return truncateToCap(lines);
@@ -200,16 +205,61 @@ export function clampCore(text: string): string {
 // SECTION_KIND выше; здесь — обе локали самой метки. Значение (путь до сводки) кончается
 // на первом пробеле или `·`, поэтому хвост строки («· Индекс: MOC.md») переживает правку
 // байт в байт, а старое значение с префиксом `vault/` заменяется целиком.
-const LAST_DAY_LABEL =
+export const LAST_DAY_LABEL =
   /^(\s*[-*][ \t]+(?:Последний день|Last day)[ \t]*:[ \t]*)([^\s·]*)(.*)$/u;
 const DAILY_SUMMARY_PREFIX = "summaries/daily/";
-// Канонический вид секции из Shape (core-format.md) — на случай, когда её нет вовсе.
+// Канонический вид секции указателей — на случай, когда её нет вовсе.
 const POINTERS_HEADING = "## Указатели";
 const LAST_DAY_LABEL_TEXT = "- Последний день: ";
 
 function newlineOf(lines: readonly CoreLine[]): string {
   for (const line of lines) if (line.ending !== "") return line.ending;
   return "\n";
+}
+
+function replaceLastDayPointer(
+  lines: CoreLine[],
+  value: string,
+  original: string,
+): string | null {
+  for (const line of lines) {
+    if (line.section !== "pointers") continue;
+    const found = LAST_DAY_LABEL.exec(line.content);
+    if (!found) continue;
+    const tail =
+      found[3] === "" || /^\s/u.test(found[3]) ? found[3] : ` ${found[3]}`;
+    const next = `${found[1]}${value}${tail}`;
+    if (next === line.content) return original;
+    line.replacement = `${next}${line.ending}`;
+    return render(lines);
+  }
+  return null;
+}
+
+function lastPointerLine(lines: readonly CoreLine[]): CoreLine | null {
+  let anchor: CoreLine | null = null;
+  for (const line of lines) {
+    if (line.section === "pointers" && line.content.trim() !== "")
+      anchor = line;
+  }
+  return anchor;
+}
+
+function appendLastDayPointer(
+  text: string,
+  lines: CoreLine[],
+  bullet: string,
+): string {
+  const newline = newlineOf(lines);
+  const anchor = lastPointerLine(lines);
+  if (anchor) {
+    anchor.replacement = `${anchor.content}${anchor.ending || newline}${bullet}${anchor.ending}`;
+    return render(lines);
+  }
+  let out = text;
+  if (out !== "" && !out.endsWith(newline)) out += newline;
+  if (out !== "" && !out.endsWith(`${newline}${newline}`)) out += newline;
+  return `${out}${POINTERS_HEADING}${newline}${newline}${bullet}${newline}`;
 }
 
 /**
@@ -231,67 +281,6 @@ export function setLastDayPointer(text: string, isoDate: string): string {
   const bullet = `${LAST_DAY_LABEL_TEXT}${value}`;
   const lines = linesOf(text);
   classifySections(lines);
-
-  let anchor: CoreLine | null = null;
-  for (const line of lines) {
-    if (line.section !== "pointers") continue;
-    if (line.content.trim() !== "") anchor = line;
-    // Первая строка-указатель и есть указатель: вторую такую же трогать нечем — какая из
-    // них правда, знает только автор файла.
-    const found = LAST_DAY_LABEL.exec(line.content);
-    if (!found) continue;
-    // Значения не было («- Последний день: · Индекс: …») — вернуть пробел, который иначе
-    // склеил бы путь с хвостом.
-    const tail =
-      found[3] === "" || /^\s/u.test(found[3]) ? found[3] : ` ${found[3]}`;
-    const next = `${found[1]}${value}${tail}`;
-    if (next === line.content) return text;
-    line.replacement = `${next}${line.ending}`;
-    return render(lines);
-  }
-
-  const newline = newlineOf(lines);
-  if (anchor) {
-    // Секция есть, строки нет: дописываем её последней содержательной строкой секции,
-    // сохраняя стиль переводов строки самого файла (в том числе их отсутствие в конце).
-    anchor.replacement = `${anchor.content}${anchor.ending || newline}${bullet}${anchor.ending}`;
-    return render(lines);
-  }
-
-  let out = text;
-  if (out !== "" && !out.endsWith(newline)) out += newline;
-  if (out !== "" && !out.endsWith(`${newline}${newline}`)) out += newline;
-  return `${out}${POINTERS_HEADING}${newline}${newline}${bullet}${newline}`;
-}
-
-export interface CoreDamage {
-  /** Заголовки `## `, которые были до хода и пропали после (без самих решёток). */
-  readonly lostHeadings: readonly string[];
-  /** Файл был непустым и стал пустым. */
-  readonly emptied: boolean;
-  readonly damaged: boolean;
-}
-
-function headingsOf(text: string): string[] {
-  const found: string[] = [];
-  for (const line of linesOf(text)) {
-    const heading = HEADING.exec(line.content);
-    if (heading) found.push(heading[1]);
-  }
-  return found;
-}
-
-/**
- * Что ночной ход снёс в CORE: сравнение файла до и после. Судим по заголовкам, а не по
- * тексту — правка строк это работа ночи, а исчезнувшая секция (в том числе
- * пользовательская, которой нет в шаблоне) это потеря данных, которую откатывает код
- * (ADR-0002).
- */
-export function coreDamage(before: string, after: string): CoreDamage {
-  const kept = new Set(headingsOf(after));
-  const lostHeadings = [...new Set(headingsOf(before))].filter(
-    (heading) => !kept.has(heading),
-  );
-  const emptied = before.trim() !== "" && after.trim() === "";
-  return { lostHeadings, emptied, damaged: lostHeadings.length > 0 || emptied };
+  const replaced = replaceLastDayPointer(lines, value, text);
+  return replaced ?? appendLastDayPointer(text, lines, bullet);
 }

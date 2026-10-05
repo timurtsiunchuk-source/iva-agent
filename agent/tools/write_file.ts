@@ -1,64 +1,128 @@
 import { defineTool } from "eve/tools";
 import { z } from "zod";
 import { existsSync, realpathSync } from "node:fs";
-import { dirname, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
+import { resolveVaultDir } from "@iva/vault-dir";
 import { writeFileAtomic } from "../lib/fs-atomic.js";
+import { parseFrontmatterOrSkip } from "../lib/frontmatter.ts";
+import { writeCore } from "../lib/core-write.ts";
+import { commitVaultWrite } from "../lib/vault-commit.ts";
+import { localStamp } from "../lib/vault-daily.ts";
+import { vaultDirErrorText } from "../lib/vault-error.ts";
+import { brokenLinksIn } from "../lib/vault-links.ts";
 
-// Host-native запись файла. Переопределяет встроенный write_file eve: пишет реальный
-// файл на VPS через каноническую атомарную запись, создавая родительские директории.
-//
-// Единственное ограничение: перезапись СУЩЕСТВУЮЩЕЙ карточки в <vault>/cards/** запрещена —
-// это полная замена файла, из-за которой терялись поля (tier/relevance/phone…) и старый текст.
-// Такие правки идут через write_card (он сливает). Всё остальное (vault/CORE.md, daily,
-// новые файлы в cards/) write_file пишет как раньше — см. instructions/10-map.md.
+// Память пишет её код; write_file оставляет внешние файлы и library/.
+const MEMORY = /^(?:daily|summaries|weekly|monthly|yearly|cards)(?:\/|$)/u;
 
-const VAULT = () => process.env.ASSISTANT_VAULT_DIR || "vault";
-
-// Сравниваем РЕАЛЬНЫЕ пути (realpath), а не лексические: симлинк vault/alias → cards
-// не должен обходить гард. Несуществующие пути realpath не берёт — резолвим родителя.
-function realOrNull(p: string): string | null {
-  try {
-    return realpathSync(p);
-  } catch {
-    return null;
+/** Реальный путь файла, которого может ещё не быть: симлинк не обходит запрет. */
+function realTarget(abs: string): string {
+  const rest: string[] = [];
+  for (let current = abs; ; current = dirname(current)) {
+    try {
+      return join(realpathSync(current), ...rest.reverse());
+    } catch {
+      if (dirname(current) === current) return abs;
+      rest.push(basename(current));
+    }
   }
 }
 
-function isExistingCard(path: string): boolean {
-  const cards = realOrNull(resolve(VAULT(), "cards"));
-  if (!cards) return false; // cards/ ещё нет — нечего защищать
-  const abs = resolve(path);
-  if (!existsSync(abs)) return false;
-  const real =
-    realOrNull(abs) ??
-    resolve(
-      realOrNull(dirname(abs)) ?? dirname(abs),
-      abs.split(sep).pop() as string,
-    );
-  return real === cards || real.startsWith(cards + sep);
+/** Перезапись существующего файла, когда vault или его cards/ не видно: проверить,
+ * не Card ли это, нельзя — отказ, а не тихое разрешение. cards/ ещё нет — защищать нечего. */
+function unverifiable(vault: string, path: string): string | null {
+  if (!existsSync(path)) return null;
+  for (const dir of [vault, join(vault, "cards")])
+    try {
+      realpathSync(dir);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (dir !== vault && code === "ENOENT") continue;
+      const why = code === "ENOENT" ? "каталога vault нет" : String(error);
+      return `не могу проверить ${dir}: ${why}`;
+    }
+  return null;
+}
+
+function brokenMarkdown(
+  vault: string,
+  rel: string,
+  path: string,
+  content: string,
+) {
+  if (!rel.endsWith(".md")) return null;
+  const body = parseFrontmatterOrSkip(content, path, () => {})?.body ?? content;
+  return brokenLinksIn(body, { vaultDir: vault, source: rel.slice(0, -3) });
+}
+
+async function writeVaultFile(
+  vault: string,
+  rel: string,
+  path: string,
+  content: string,
+) {
+  const bytes = Buffer.byteLength(content, "utf8");
+  if (MEMORY.test(rel))
+    return {
+      ok: false,
+      path,
+      error:
+        "write_file не пишет память: сырой день и выжимки ведёт ночь, Card меняет write_card.",
+    };
+  const broken = brokenMarkdown(vault, rel, path, content);
+  if (broken) return { ok: false, path, error: broken };
+  if (rel === "CORE.md") {
+    const result = await writeCore({
+      vault,
+      next: content,
+      reason: "day write_file",
+      date: localStamp().date,
+      mode: "day",
+    });
+    return result.ok
+      ? { ok: true, path, bytes }
+      : { ok: false, path, error: result.error ?? "CORE не записан" };
+  }
+  await writeFileAtomic(path, content);
+  await commitVaultWrite(`file ${rel}: write`, [path], vault);
+  return { ok: true, path, bytes };
 }
 
 export default defineTool({
   description:
-    "Записать файл НАПРЯМУЮ на файловую систему хоста VPS (UTF-8). " +
-    "Родительские директории создаются автоматически (mkdir -p). " +
-    "Перезаписывает файл целиком. Возвращает { ok, path, bytes }. " +
-    "ИСКЛЮЧЕНИЕ: существующую карточку в vault/cards/** перезаписывать нельзя — используй write_card.",
+    "Записать UTF-8 файл, директории создаются. В vault: CORE.md через общий писатель CORE (лимит, History); daily/, summaries/, weekly/, monthly/, yearly/ и cards/ закрыты (Card меняет write_card); остальное, например library/, пишется и коммитится.",
   inputSchema: z.object({
-    path: z.string().min(1).describe("Абсолютный путь к файлу на хосте"),
-    content: z.string().describe("Содержимое для записи (UTF-8)"),
+    path: z.string().min(1).describe("Абсолютный путь"),
+    content: z.string().describe("Содержимое UTF-8"),
   }),
   async execute({ path, content }) {
-    if (isExistingCard(path)) {
-      return {
-        ok: false,
-        path,
-        error:
-          "Карточка уже существует — write_file затёр бы её целиком (поля вне схемы и старый текст). " +
-          "Используй write_card: он сливает новое содержимое со старым.",
-      };
+    const bytes = Buffer.byteLength(content, "utf8");
+    try {
+      const vault = resolveVaultDir(process.cwd());
+      const blocked = unverifiable(vault, resolve(path));
+      if (blocked) {
+        console.error(`[write_file] ${blocked}`);
+        return { ok: false, path, error: blocked };
+      }
+      const rel = relative(realTarget(vault), realTarget(resolve(path)))
+        .split(sep)
+        .join("/");
+      if (rel.startsWith("..") || isAbsolute(rel)) {
+        await writeFileAtomic(path, content);
+        return { ok: true, path, bytes };
+      }
+      return await writeVaultFile(vault, rel, path, content);
+    } catch (error) {
+      const text = vaultDirErrorText(error);
+      if (text !== null) return { ok: false, path, error: text };
+      throw error;
     }
-    await writeFileAtomic(path, content);
-    return { ok: true, path, bytes: Buffer.byteLength(content, "utf8") };
   },
 });

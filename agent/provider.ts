@@ -1,5 +1,15 @@
+import {
+  resolveOpenCodeProtocol,
+  type OpenCodeProtocol,
+} from "@iva/opencode-protocol";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { wrapLanguageModel, type LanguageModelMiddleware } from "ai";
+import { join } from "node:path";
+import {
+  APICallError,
+  wrapLanguageModel,
+  type LanguageModelMiddleware,
+} from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import {
@@ -10,7 +20,7 @@ import {
   MAX_IMAGE_BYTES,
 } from "./lib/attachment-ref.ts";
 import { resolveAttachmentPath } from "./lib/telegram-media-cache.ts";
-import { chatModelSeesImages } from "./vision.ts";
+import { claudeContextWindow, makeClaudeCliModel } from "./lib/claude-cli.ts";
 import {
   CODEX_BASE_URL,
   codexAuthHeaders,
@@ -18,10 +28,14 @@ import {
 } from "./lib/codex-auth.ts";
 import { resolveContextWindow } from "./lib/context-window.ts";
 import {
+  MODEL_PROVIDERS,
   resolveModelProvider,
   type ModelProviderName,
 } from "./lib/model-provider.ts";
 import { CANONICAL_REASONING_EFFORTS as EFFORTS } from "./lib/reasoning-levels.ts";
+import { toolNameWireMiddleware } from "./lib/tool-wire-name.ts";
+import { repeatGuardMiddleware } from "./lib/repeat-guard.ts";
+import { compactionUsageMiddleware, type UsageLabel } from "./lib/usage-tap.ts";
 
 type WrappableModel = Parameters<typeof wrapLanguageModel>[0]["model"];
 type ModelStreamPart =
@@ -40,7 +54,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 // MODEL_PROVIDER валит загрузку модуля здесь же, до первого запроса к провайдеру.
 // ollama/opencode/openrouter — OpenAI-совместимы (chat/completions, статичный ключ из .env).
 // codex — личная подписка OpenAI (ChatGPT): Responses API + OAuth-токен (data/codex-auth.json,
-// `iva login`). custom — тот же OpenAI-совместимый провод, но адрес задаёт владелец
+// `iva login`). claude — подписка Claude Pro/Max через установленный Claude Code CLI: ни
+// адреса, ни ключа, ход уходит процессу `claude` (agent/lib/claude-cli.ts).
+// custom — тот же OpenAI-совместимый провод, но адрес задаёт владелец
 // (CUSTOM_BASE_URL): чужой прокси, vLLM, LiteLLM, вендорская подписка. Имена моделей и их
 // дефолты живут в agent/lib/model-provider.ts (там же и переменные *_VISION_MODEL); здесь
 // остаётся то, что из .env не задаётся ни у кого: адрес, ключ и окно контекста.
@@ -73,6 +89,15 @@ const PROVIDERS = {
     apiKey: undefined, // авторизация — OAuth-токен подписки, не статичный ключ (см. codexFetch)
     contextWindow: 272000,
   },
+  claude: {
+    // Адрес никто не открывает: модель — процесс `claude`, и строка называет вендора в
+    // журнале и в провайдер-опциях. Ключа нет намеренно: авторизацию держит CLI (подписка
+    // владельца), и ключ в .env увёл бы ход мимо подписки — agent/lib/claude-cli.ts такой
+    // .env отвергает, а не молча берёт его.
+    baseURL: "process://claude",
+    apiKey: undefined,
+    contextWindow: claudeContextWindow(selected.model),
+  },
   custom: {
     // Адрес целиком задаёт владелец, вместе с суффиксом вида /v1 — как у ollama
     // (https://ollama.com/v1). Хвостовой слэш срезаем: к адресу приклеивается /chat/completions.
@@ -104,6 +129,17 @@ export const providerConfig = {
     PROVIDERS[PROVIDER].contextWindow,
   ),
   textModel: selected.model,
+  opencodeProtocol:
+    selected.name === "opencode"
+      ? resolveOpenCodeProtocol(process.env.OPENCODE_PROTOCOL)
+      : undefined,
+  opencodeVisionProtocol:
+    selected.name === "opencode"
+      ? resolveOpenCodeProtocol(
+          process.env.OPENCODE_VISION_PROTOCOL,
+          "OPENCODE_VISION_PROTOCOL",
+        )
+      : undefined,
   // Модель для картинок — из того же резолвера (переменные *_VISION_MODEL, дефолты там же).
   // У codex это та же текстовая модель: подписка мультимодальна.
   visionModel: selected.visionModel,
@@ -116,6 +152,64 @@ if (providerName === "custom" && !providerConfig.baseURL)
   throw new Error(
     "MODEL_PROVIDER=custom requires CUSTOM_BASE_URL (OpenAI-compatible base, e.g. https://api.example.com/v1) — run: iva config",
   );
+
+// --- OpenCode Go: что провайдер требует от клиента --------------------------------------------
+// С сентября 2026 Go принимает запрос только от клиента, который (1) называет себя своим
+// User-Agent, а не именем SDK, и (2) шлёт стабильный ID диалога в x-opencode-session. Без них
+// каждый ход падает 4xx MissingSessionID (https://opencode.ai/docs/go/#where-can-i-use-it).
+// ID диалога — sessionId eve: agent.ts получает его на session.started и строит модель под
+// него. Там, где сессии нет (планировщик, vision-пробник, describeImage), идёт один ID на
+// процесс: заголовок обязан быть всегда, пустой не уходит никогда. Остальным провайдерам
+// заголовки не достаются — их провод остаётся ровно таким, каким был.
+function readOwnVersion(): string {
+  // От cwd, не от import.meta.url: authored-модули инлайнятся в кэш eve (см. lib/data-dir.ts).
+  try {
+    const parsed: unknown = JSON.parse(
+      readFileSync(join(process.cwd(), "package.json"), "utf8"),
+    );
+    if (isRecord(parsed) && typeof parsed.version === "string") {
+      const version = parsed.version.trim();
+      if (version.length > 0) return version;
+    }
+  } catch {
+    /* версия нужна только для User-Agent — без неё ход не падает */
+  }
+  return "0";
+}
+export const IVA_USER_AGENT = `iva/${readOwnVersion()}`;
+const PROCESS_SESSION_ID = `iva-${randomUUID()}`;
+
+/**
+ * ID диалога на проводе: sessionId eve как есть, без него — ID процесса. Им подписан
+ * x-opencode-session у Go и prompt_cache_key у Codex.
+ */
+function wireSessionId(sessionId?: string): string {
+  const id = (sessionId ?? "").trim();
+  return id.length > 0 ? id : PROCESS_SESSION_ID;
+}
+
+/** Заголовки клиента для активного провайдера. Требует их только Go; остальным — ничего. */
+export function providerRequestHeaders(
+  sessionId?: string,
+): Record<string, string> | undefined {
+  if (providerName !== "opencode") return undefined;
+  return {
+    "x-opencode-session": wireSessionId(sessionId),
+    "user-agent": IVA_USER_AGENT,
+  };
+}
+
+// AI SDK ставит свой User-Agent (`ai/… ai-sdk/… runtime/node.js`) поверх заголовков
+// провайдера — ровно то «имя SDK», которое Go отказывается принимать. Поэтому у Go свой
+// fetch: имя клиента ставится в самом запросе, после SDK. ID диалога SDK не трогает,
+// он едет обычными заголовками модели.
+export const opencodeFetch: typeof fetch = (input, init) => {
+  const headers = new Headers(
+    init?.headers ?? (input instanceof Request ? input.headers : undefined),
+  );
+  headers.set("user-agent", IVA_USER_AGENT);
+  return fetch(input, { ...init, headers });
+};
 
 // THINKING_EFFORT (.env, пишут /model и /think в Telegram): reasoning-усилие модели.
 // Codex получает его через providerOptions.openai.reasoningEffort ниже. Ollama Cloud
@@ -241,35 +335,64 @@ export const codexFetch: typeof fetch = async (input, init) => {
 };
 
 // Провайдер-опции codex на этапе СБОРКИ тела (не пост-фактум в codexFetch): store:false
-// и reasoning-усилие из THINKING_EFFORT.
+// и reasoning-усилие из THINKING_EFFORT по умолчанию; явные опции вызова сильнее.
 // store:false: без него @ai-sdk/openai берёт store:true по умолчанию и реплеит прошлые ответы
 // ассистента как item_reference (голая ссылка на msg_-item, без контента); codexFetch затем
 // ставит store:false — и stateless-бэкенд подписки не находит item → сессия падает со второго
 // запроса ("Item ... not found. Items are not persisted when store is set to false").
 // store:false заставляет SDK инлайнить историю целиком.
 // reasoningSummary:null гасит побочный эффект SDK: при заданном reasoningEffort он сам
-// добавляет summary:"detailed" в reasoning-блок. Summary нам не нужен (reasoning всё равно
-// вырезается withReasoningStripped), а лишний параметр — лишний шанс на 400 от бэкенда.
-const codexProviderOptions: LanguageModelMiddleware = {
-  transformParams({ params }) {
-    return Promise.resolve({
-      ...params,
-      providerOptions: {
-        ...params.providerOptions,
-        openai: {
-          ...params.providerOptions?.openai,
-          store: false,
-          ...(thinkingEffort
-            ? { reasoningEffort: thinkingEffort, reasoningSummary: null }
-            : {}),
+// добавляет summary:"detailed" в reasoning-блок. Summary нам не нужен (обратно модели едет
+// encrypted_content, владельцу рассуждение не показывается), а лишний параметр — лишний шанс
+// на 400 от бэкенда.
+// forceReasoning:true: SDK решает «рассуждающая ли модель» по префиксу id (o1/o3/gpt-5…) и
+// для незнакомой серии молча выбрасывает reasoningEffort ("not supported for non-reasoning
+// models"), шлёт system вместо developer и не просит reasoning.encrypted_content. Живой
+// прогон 23.09.2026: gpt-6-sol и gpt-6-luna уходили без reasoning. Все модели подписки
+// рассуждающие (у каждой supported_reasoning_levels в /models), поэтому флаг общий.
+// strict:false на каждом инструменте - явно, как Hermes в своём Codex-адаптере. AI SDK поле
+// не шлёт, а Responses API без него включает строгий режим сам: тогда все поля схемы
+// обязательны, и модель забивает необязательные мусором (живой прогон 13.09.2026:
+// luna слала в remind `cron: ":"`, `id: ":? "`, получала «give exactly one of at or cron»
+// и повторяла это 33 раза, пока висело «Работаю»).
+// promptCacheKey (в теле prompt_cache_key) — ID диалога, как у Codex CLI: бэкенд по нему
+// ведёт шаги одного диалога к одному кэшу, и префикс прошлого шага читается из кэша. Без
+// ключа соседние шаги попадали в кэш через раз. Без сессии ключ — ID процесса (wireSessionId).
+export function codexProviderOptions(
+  sessionId?: string,
+): LanguageModelMiddleware {
+  const promptCacheKey = wireSessionId(sessionId);
+  return {
+    transformParams: ({ params }) =>
+      Promise.resolve({
+        ...params,
+        tools: params.tools?.map((tool) =>
+          tool.type === "function" ? { ...tool, strict: false } : tool,
+        ),
+        providerOptions: {
+          ...params.providerOptions,
+          openai: {
+            ...(thinkingEffort
+              ? { reasoningEffort: thinkingEffort, reasoningSummary: null }
+              : {}),
+            ...params.providerOptions?.openai,
+            store: false,
+            forceReasoning: true,
+            promptCacheKey,
+          },
         },
-      },
-    });
-  },
-};
+      }),
+  };
+}
 
-/** Строит Codex-модель (Responses API подписки). Общая для agent.ts и vision.ts. */
-export function makeCodexModel(model: string = providerConfig.textModel) {
+/**
+ * Строит Codex-модель (Responses API подписки). Общая для agent.ts и vision.ts; sessionId —
+ * ключ кэша промпта (см. codexProviderOptions).
+ */
+export function makeCodexModel(
+  model: string = providerConfig.textModel,
+  sessionId?: string,
+) {
   const openai = createOpenAI({
     baseURL: CODEX_BASE_URL,
     apiKey: "chatgpt-subscription",
@@ -277,7 +400,7 @@ export function makeCodexModel(model: string = providerConfig.textModel) {
   });
   return wrapLanguageModel({
     model: openai.responses(model),
-    middleware: codexProviderOptions,
+    middleware: codexProviderOptions(sessionId),
   });
 }
 
@@ -381,8 +504,12 @@ export function attachVaultImages(
       console.error(`[vision] картинку ${rel} из Vault не прочитал:`, error);
       continue;
     }
-    if (data.byteLength > MAX_IMAGE_BYTES) {
-      console.error(`[vision] картинка ${rel} больше потолка, иду без неё`);
+    if (data.byteLength === 0 || data.byteLength > MAX_IMAGE_BYTES) {
+      console.error(
+        data.byteLength === 0
+          ? `[vision] картинка ${rel} пустая, иду без неё`
+          : `[vision] картинка ${rel} больше потолка, иду без неё`,
+      );
       continue;
     }
     if (data.byteLength > budget) {
@@ -410,23 +537,35 @@ export function attachVaultImages(
   });
 }
 
-export const attachImagesMiddleware: LanguageModelMiddleware = {
-  async transformParams({ params }) {
-    // Ссылки ищем ДО пробника: ход без картинок не будит сеть, и сам пробник (он идёт
-    // через makeTextModel, то есть через этот же middleware) не ждёт собственного вердикта.
-    if (!Array.isArray(params.prompt)) return params;
-    const hasRefs = params.prompt.some(
-      (message) =>
-        isUserMessage(message) && imageRefsInMessage(message).length > 0,
-    );
-    if (!hasRefs) return params;
-    if (!(await chatModelSeesImages())) return params;
-    return {
-      ...params,
-      prompt: attachVaultImages(params.prompt, { readImage: readVaultImage }),
-    };
-  },
-};
+/**
+ * Прикладывает картинки Vault к промпту. Предикат «текстовая модель видит картинки»
+ * приходит параметром, а не импортом `vision.ts`: vision сам зовёт `makeTextModel()`
+ * для пробника, и этот импорт замыкал цикл provider ↔ vision. Форма — как у эффектов
+ * telegram-media: потребитель (agent.ts, planner, vision) отдаёт свою реализацию.
+ */
+export type ImageCapability = () => Promise<boolean>;
+
+export function attachImagesMiddleware(
+  chatModelSeesImages: ImageCapability,
+): LanguageModelMiddleware {
+  return {
+    async transformParams({ params }) {
+      // Ссылки ищем ДО пробника: ход без картинок не будит сеть, и сам пробник (он идёт
+      // через makeTextModel, то есть через этот же middleware) не ждёт собственного вердикта.
+      if (!Array.isArray(params.prompt)) return params;
+      const hasRefs = params.prompt.some(
+        (message) =>
+          isUserMessage(message) && imageRefsInMessage(message).length > 0,
+      );
+      if (!hasRefs) return params;
+      if (!(await chatModelSeesImages())) return params;
+      return {
+        ...params,
+        prompt: attachVaultImages(params.prompt, { readImage: readVaultImage }),
+      };
+    },
+  };
+}
 
 // Silent provider streams can keep a turn open indefinitely.
 // Remove when eve forwards ai SDK `timeout.firstChunkMs` to ToolLoopAgent (vercel/ai#17315 added the option; no eve issue yet).
@@ -552,21 +691,179 @@ export const modelFirstChunkDeadlineMiddleware: LanguageModelMiddleware = {
   },
 };
 
+// --- Схема инструмента, которую провайдер не принимает --------------------------------------
+// OpenAI (codex) отвергает ВЕСЬ запрос, если у любого инструмента в `pattern` стоит lookaround:
+// «Invalid JSON schema: regex lookaround is not supported. Found at $.properties.….pattern»,
+// 400, `param: tools` (пакет пользователя 13.09.2026: календарный инструмент с полем attendees, источник в пакете не различим - личный слой data/custom или подключение;
+// ход умирал до первого слова модели). Инструменты приходят откуда угодно - плагины,
+// подключения eve, свои - а граница с провайдером одна, эта. Как у Hermes (issue #42631):
+// отказ по схеме = вырезать такие `pattern` из инструментов ЭТОГО запроса и повторить один раз.
+// Остальная схема, включая описание поля, остаётся: модель по-прежнему видит, что от неё ждут.
+const LOOKAROUND_PATTERN = /\(\?<?[=!]/u;
+
+/** Копия схемы без `pattern` с lookaround на любой глубине; `dropped` считает вырезанные. */
+export function withoutLookaroundPatterns(
+  schema: unknown,
+  dropped = { count: 0 },
+): unknown {
+  if (Array.isArray(schema))
+    return schema.map((item) => withoutLookaroundPatterns(item, dropped));
+  if (!isRecord(schema)) return schema;
+  const copy: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (
+      key === "pattern" &&
+      typeof value === "string" &&
+      LOOKAROUND_PATTERN.test(value)
+    ) {
+      dropped.count++;
+      continue;
+    }
+    copy[key] = withoutLookaroundPatterns(value, dropped);
+  }
+  return copy;
+}
+
+export function isToolSchemaRejection(error: unknown): boolean {
+  return (
+    APICallError.isInstance(error) &&
+    error.statusCode === 400 &&
+    /invalid[ _-]?json[ _-]?schema/iu.test(error.message)
+  );
+}
+
+export const toolSchemaRetryMiddleware: LanguageModelMiddleware = {
+  async wrapStream({ doStream, model, params }) {
+    try {
+      return await doStream();
+    } catch (error) {
+      if (!isToolSchemaRejection(error) || !params.tools?.length) throw error;
+      const dropped = { count: 0 };
+      const tools = params.tools.map((tool) =>
+        tool.type === "function"
+          ? {
+              ...tool,
+              inputSchema: withoutLookaroundPatterns(
+                tool.inputSchema,
+                dropped,
+              ) as typeof tool.inputSchema,
+            }
+          : tool,
+      );
+      if (dropped.count === 0) throw error; // не та схема: чинить нечего, ошибка наружу
+      console.error(
+        `[provider] the provider rejected a tool schema; retrying without ${dropped.count} regex pattern(s) with lookaround`,
+      );
+      return model.doStream({ ...params, tools });
+    }
+  },
+};
+
+// --- Соседние user-сообщения ------------------------------------------------------------------
+// Строка времени (agent/instructions/now.ts) приходит user-сообщением перед вводом владельца, и
+// eve их не склеивает. Часть chat-шаблонов (vLLM, llama.cpp) отвергает две реплики одной роли
+// подряд, поэтому граница с провайдером отдаёт их одним сообщением: всем вендорам, одним правилом.
+type UserMessage = Extract<ModelMessage, { role: "user" }>;
+
+function mergeUserMessages(first: UserMessage, next: UserMessage): UserMessage {
+  const content: UserMessage["content"] = [];
+  for (const part of [...first.content, ...next.content]) {
+    const previous = content.at(-1);
+    if (part.type === "text" && previous?.type === "text")
+      content[content.length - 1] = {
+        ...previous,
+        text: `${previous.text}\n\n${part.text}`,
+      };
+    else content.push(part);
+  }
+  return { role: "user", content };
+}
+
+function withAdjacentUserMessagesMerged(prompt: ModelPrompt): ModelPrompt {
+  const merged: ModelMessage[] = [];
+  for (const message of prompt) {
+    const last = merged.at(-1);
+    if (message.role === "user" && last?.role === "user")
+      merged[merged.length - 1] = mergeUserMessages(last, message);
+    else merged.push(message);
+  }
+  return merged;
+}
+
+const adjacentUserMessagesMiddleware: LanguageModelMiddleware = {
+  transformParams({ params }) {
+    return Promise.resolve({
+      ...params,
+      prompt: withAdjacentUserMessagesMerged(params.prompt),
+    });
+  },
+};
+
 /**
  * Текстовая модель активного провайдера. Общая для КАЖДОГО узла графа: корень и субагенты
  * обязаны говорить с одним провайдером, свои createOpenAICompatible/env в субагентах не заводим.
  */
-export function makeTextModel() {
+export function makeTextModel(options: {
+  sessionId?: string;
+  chatModelSeesImages: ImageCapability;
+  // Чей шаг ведёт модель: расход компактации eve уходит в usage.jsonl под этим ходом.
+  usage?: UsageLabel;
+}) {
   return wrapLanguageModel({
-    model: makeBareTextModel(),
-    middleware: [attachImagesMiddleware, modelFirstChunkDeadlineMiddleware],
+    model: makeBareTextModel(options.sessionId),
+    middleware: [
+      repeatGuardMiddleware,
+      attachImagesMiddleware(options.chatModelSeesImages),
+      toolSchemaRetryMiddleware,
+      modelFirstChunkDeadlineMiddleware,
+      adjacentUserMessagesMiddleware,
+      // Порядок свободен: кодирование идемпотентно, других читателей toolName в цепочке нет.
+      toolNameWireMiddleware(MODEL_PROVIDERS[providerName].toolNameMax),
+      compactionUsageMiddleware(options.usage),
+    ],
   });
 }
 
-function makeBareTextModel() {
+/** The same Go Responses factory serves text and an explicitly configured vision fallback. */
+export function makeOpenCodeModel(
+  model: string,
+  protocol: OpenCodeProtocol,
+  sessionId?: string,
+) {
+  if (!PROVIDERS.opencode.apiKey)
+    throw new Error(
+      "MODEL_PROVIDER=opencode requires OPENCODE_API_KEY — run: iva config",
+    );
+  const config = {
+    baseURL: PROVIDERS.opencode.baseURL,
+    apiKey: PROVIDERS.opencode.apiKey,
+    headers: providerRequestHeaders(sessionId),
+    fetch: opencodeFetch,
+  };
+  return protocol === "responses"
+    ? createOpenAI(config).responses(model)
+    : createOpenAICompatible({
+        ...config,
+        name: "iva-opencode",
+        includeUsage: true,
+      })(model);
+}
+
+function makeBareTextModel(sessionId?: string) {
   // Codex-подписка говорит на Responses API — отдельная модель-фабрика (@ai-sdk/openai).
-  // Остальные провайдеры — OpenAI-совместимый chat/completions через openai-compatible.
-  if (providerName === "codex") return makeCodexModel();
+  // Claude-подписка — тоже своя модель: рукописная LanguageModelV4 поверх Claude Code CLI
+  // (stream-json), потому что API-адреса у неё нет вовсе.
+  // Go выбирает провод явно; остальные API-ключи говорят chat/completions.
+  if (providerName === "codex")
+    return makeCodexModel(providerConfig.textModel, sessionId);
+  if (providerName === "claude")
+    return makeClaudeCliModel(providerConfig.textModel, { sessionId });
+  if (providerName === "opencode")
+    return makeOpenCodeModel(
+      providerConfig.textModel,
+      providerConfig.opencodeProtocol!,
+      sessionId,
+    );
   return createOpenAICompatible({
     name: `iva-${providerName}`,
     baseURL: providerConfig.baseURL,
@@ -578,13 +875,19 @@ function makeBareTextModel() {
   })(providerConfig.textModel);
 }
 
-// --- Анти-InvalidPrompt: срезаем reasoning из вывода модели ---------------------------------
-// deepseek (openai-compatible) иногда отдаёт reasoning-часть без поля `text`. eve хранит reasoning
-// в истории и реплеит её каждый ход, а ai@7 ModelMessage-схема требует у reasoning непустой string
-// `text` → одна такая часть бросает AI_InvalidPromptError в standardizePrompt и отравляет сессию
-// навсегда (Iva молчит в треде до ручного сброса). reasoning в реплее не нужен — это приватное
-// «мышление», юзеру не видно — поэтому выкидываем его из ВЫВОДА целиком, и в историю он не попадает.
-// Подтверждено репродукцией: reasoning с text:"" проходит, без text — FAIL (см. implementation-notes, вне публичного дерева).
+// --- Рассуждение в истории хода: возвращаем там, где вендор его принимает ---------------------
+// eve хранит вывод модели в истории и реплеит его на каждом следующем шаге и ходе. Правило одно
+// на всех вендоров, решение по вендору — одна строка replaysReasoning в MODEL_PROVIDERS
+// (agent/lib/model-provider.ts):
+//  - вендор принимает рассуждение обратно (codex: reasoning-item с encrypted_content) — оно
+//    остаётся в выводе и едет в следующий запрос, модель не теряет ход мысли между шагами;
+//  - не принимает или это не доказано — рассуждение вырезается из вывода (в историю не попадает)
+//    и из промпта (история, записанная до смены вендора в той же сессии).
+// Исходный дефект закрыт у всех: deepseek (openai-compatible) отдавал reasoning-часть без поля
+// `text`, а ai@7 ModelMessage-схема требует у reasoning string `text` → AI_InvalidPromptError в
+// standardizePrompt ещё до модели, и сессия отравлена навсегда (Iva молчит в треде до сброса).
+// Промпт до middleware уже провалидирован, поэтому такая часть режется на выходе, а не на входе.
+// Подтверждено репродукцией: reasoning с text:"" проходит, без text — FAIL.
 const REASONING_PART_TYPES = new Set([
   "reasoning",
   "reasoning-start",
@@ -593,30 +896,73 @@ const REASONING_PART_TYPES = new Set([
   "reasoning-file",
 ]);
 
-const stripReasoningMiddleware: LanguageModelMiddleware = {
-  async wrapGenerate({ doGenerate }) {
-    const result = await doGenerate();
-    return {
-      ...result,
-      content: result.content.filter((p) => p.type !== "reasoning"),
-    };
-  },
-  async wrapStream({ doStream }) {
-    const { stream, ...rest } = await doStream();
-    return {
-      ...rest,
-      stream: stream.pipeThrough(
-        new TransformStream({
-          transform(part, controller) {
-            if (!REASONING_PART_TYPES.has(part.type)) controller.enqueue(part);
-          },
-        }),
-      ),
-    };
-  },
-};
+type StreamPart = { type: string; delta?: unknown };
+type ContentPart = { type: string; text?: unknown };
 
-/** Оборачивает текстовую модель так, чтобы reasoning не попадал в реплеемую историю. */
-export function withReasoningStripped(model: WrappableModel): WrappableModel {
-  return wrapLanguageModel({ model, middleware: stripReasoningMiddleware });
+/** Часть вывода, которой нельзя в историю: любое рассуждение у вендора без возврата, и
+ *  рассуждение без строки у любого (оно отравило бы реплей). */
+function unreplayableOutput(part: StreamPart | ContentPart, replays: boolean) {
+  if (!REASONING_PART_TYPES.has(part.type)) return false;
+  if (!replays) return true;
+  if (part.type === "reasoning")
+    return typeof (part as ContentPart).text !== "string";
+  if (part.type === "reasoning-delta")
+    return typeof (part as StreamPart).delta !== "string";
+  return false;
+}
+
+export function reasoningReplayMiddleware(
+  replays: boolean,
+): LanguageModelMiddleware {
+  return {
+    transformParams({ params }) {
+      if (replays) return Promise.resolve(params);
+      return Promise.resolve({
+        ...params,
+        prompt: params.prompt.map((message) =>
+          message.role === "assistant"
+            ? {
+                ...message,
+                content: message.content.filter(
+                  (part) => !REASONING_PART_TYPES.has(part.type),
+                ),
+              }
+            : message,
+        ),
+      });
+    },
+    async wrapGenerate({ doGenerate }) {
+      const result = await doGenerate();
+      return {
+        ...result,
+        content: result.content.filter(
+          (part) => !unreplayableOutput(part, replays),
+        ),
+      };
+    },
+    async wrapStream({ doStream }) {
+      const { stream, ...rest } = await doStream();
+      return {
+        ...rest,
+        stream: stream.pipeThrough(
+          new TransformStream({
+            transform(part, controller) {
+              if (!unreplayableOutput(part, replays)) controller.enqueue(part);
+            },
+          }),
+        ),
+      };
+    },
+  };
+}
+
+/** Оборачивает текстовую модель правилом возврата рассуждения активного вендора. */
+export function withReplayableReasoning(
+  model: WrappableModel,
+  replays: boolean = MODEL_PROVIDERS[providerName].replaysReasoning,
+): WrappableModel {
+  return wrapLanguageModel({
+    model,
+    middleware: reasoningReplayMiddleware(replays),
+  });
 }

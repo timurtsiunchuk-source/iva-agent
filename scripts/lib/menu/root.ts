@@ -1,16 +1,15 @@
-// Корневой экран /menu: одно сообщение, кнопки по две в ряд (паттерн hermes). Все кнопки
-// несут либо навигацию (o-верб к под-экрану), либо хендофф (mdl/thk), либо закрытие (r:x) —
-// их целиком обрабатывает движок, поэтому on() тут пустой.
+// Корневой экран /menu: одна rich-карта — заголовок, затем строка с кнопкой на каждый
+// раздел. Пояснения к рядам убраны по решению владельца 2026-09-22: экран — только
+// заголовок и кнопки. Все кнопки несут либо навигацию (o-верб к под-экрану), либо
+// хендофф (mdl/thk), либо закрытие (r:x) — их целиком обрабатывает движок, поэтому on()
+// тут пустой.
 //
 // Правило репо: ни одной module-level const с переведённой строкой — все подписи собираются
 // в render() через ctx.tr, иначе язык замёрзнет до рестарта.
-interface MenuButton {
-  text: string;
-  callback_data: string;
-}
+import { button, type RichButtonStyle } from "./buttons.ts";
+import { menuStyle } from "../telegram-buttons.ts";
 
 interface RootContext {
-  btn: (text: string, callbackData: string) => MenuButton;
   tr: (english: string, russian: string) => string;
 }
 
@@ -19,46 +18,39 @@ type RootState = Record<string, unknown>;
 export default {
   parent: null,
   render(_state: RootState, ctx: RootContext) {
-    const b = ctx.btn;
     const T = ctx.tr;
-    const rows = [
-      [
-        b(T("🧠 Model", "🧠 Модель"), "iva_menu:mdl"),
-        b(T("🤔 Thinking", "🤔 Размышления"), "iva_menu:thk"),
-      ],
-      [
-        b(T("🔍 Search", "🔍 Поиск"), "iva_menu:srch:o"),
-        b(T("🌐 Language", "🌐 Язык"), "iva_menu:lang:o"),
-      ],
-      [
-        b(T("🎭 Character", "🎭 Характер"), "iva_menu:chr:o"),
-        b(T("💾 Memory", "💾 Память"), "iva_menu:core:o"),
-      ],
-      [
-        b(T("📡 Userbot", "📡 Userbot"), "iva_menu:ub:o"),
-        b(T("🔗 Google", "🔗 Google"), "iva_menu:gws:o"),
-      ],
-      [
-        b(T("⏰ Timers", "⏰ Кроны"), "iva_menu:cron:o"),
-        b(T("🔔 Notices", "🔔 Уведомления"), "iva_menu:ntc:o"),
-      ],
-      [
-        b(T("🧩 Skills", "🧩 Скиллы"), "iva_menu:sk:o"),
-        b(T("📊 Status", "📊 Статус"), "iva_menu:st:o"),
-      ],
-      [
-        b(T("🔀 New messages", "🔀 Новые сообщения"), "iva_menu:turn:o"),
-        b(T("🛠 Maintenance", "🛠 Обслуживание"), "iva_menu:svc:o"),
-      ],
-      [b(T("✖ Close", "✖ Закрыть"), "iva_menu:r:x")],
+    const item = (label: string, data: string, style?: RichButtonStyle) =>
+      button(label, data, style);
+    const text = [
+      `# ${T("⚙️ Settings", "⚙️ Настройки")}`,
+      item(T("🧠 Model", "🧠 Модель"), "iva_menu:mdl"),
+      item(T("🤔 Thinking", "🤔 Размышления"), "iva_menu:thk"),
+      item(T("🔍 Search", "🔍 Поиск"), "iva_menu:srch:o"),
+      item(T("💬 Rich replies", "💬 Богатые ответы"), "iva_menu:rich:o"),
+      item(T("🎤 Voice", "🎤 Голос"), "iva_menu:voice:o"),
+      item(T("🌐 Language", "🌐 Язык"), "iva_menu:lang:o"),
+      item(T("🎭 Character", "🎭 Характер"), "iva_menu:chr:o"),
+      item(T("💾 Memory", "💾 Память"), "iva_menu:core:o"),
+      item(T("📡 Userbot", "📡 Userbot"), "iva_menu:ub:o"),
+      item(T("🔗 Google", "🔗 Google"), "iva_menu:gws:o"),
+      item(T("⏰ Timers", "⏰ Кроны"), "iva_menu:cron:o"),
+      item(T("🔔 Notices", "🔔 Уведомления"), "iva_menu:ntc:o"),
+      item(T("🧩 Skills", "🧩 Скиллы"), "iva_menu:sk:o"),
+      item(T("📊 Status", "📊 Статус"), "iva_menu:st:o"),
+      item(T("🔀 New messages", "🔀 Новые сообщения"), "iva_menu:turn:o"),
+      item(T("🛠 Maintenance", "🛠 Обслуживание"), "iva_menu:svc:o"),
+      // Новое (rich) меню носит внизу выход в старое: кому не зашло, вернётся одним тапом.
+      ...(menuStyle() === "rich"
+        ? [
+            item(
+              T("◀︎ Classic menu", "◀︎ Старое меню"),
+              "iva_menu:svc:menu:classic",
+            ),
+          ]
+        : []),
+      item(T("✖ Close", "✖ Закрыть"), "iva_menu:r:x", "danger"),
     ];
-    return {
-      text: T(
-        "⚙️ Settings\n\nPick a section.",
-        "⚙️ Настройки\n\nВыбери раздел.",
-      ),
-      rows,
-    };
+    return { text: text.join("\n\n") };
   },
   on(...args: unknown[]) {
     void args;

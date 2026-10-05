@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import fc from "fast-check";
+import type { TurnStreamEvent } from "../lib/reminder-turn.ts";
 import { dispatchCli } from "./main.ts";
 import {
   createRemindCommand,
   type RemindDependencies,
+  type ReminderClientOptions,
   type ReminderTurn,
 } from "./remind.ts";
 import { createCliRuntime } from "./runtime.ts";
@@ -15,7 +17,7 @@ import { createCliRuntime } from "./runtime.ts";
 const RUNS = { numRuns: 500 };
 const ROOT = "/tmp/iva-cli-remind-test";
 
-type AgentOutcome = "ok" | "empty" | "failed" | "throw" | "timeout";
+type AgentOutcome = "ok" | "empty" | "failed" | "throw";
 type SendResult = { ok: boolean; fellBack: boolean; error: string };
 type SendCall = readonly [
   bot: string,
@@ -24,12 +26,35 @@ type SendCall = readonly [
   options: { readonly retryTransient?: boolean } | undefined,
 ];
 
+// The turn reads its client's response as a stream, so a fake client answers with an async
+// iterable of events plus eve's cooperative cancel and the session id a stop would use.
+function fakeTurnResponse(events: readonly TurnStreamEvent[]) {
+  let index = 0;
+  return Object.assign(
+    {
+      [Symbol.asyncIterator]: (): AsyncIterator<TurnStreamEvent> => ({
+        next: () => {
+          const event = events[index];
+          index += 1;
+          return Promise.resolve(
+            event === undefined
+              ? { done: true, value: undefined }
+              : { done: false, value: event },
+          );
+        },
+      }),
+    },
+    { cancel: () => Promise.resolve(), sessionId: "sess-remind" },
+  );
+}
+
 function remindCommand(
   agentOutcome: AgentOutcome,
   sendResult: SendResult = { ok: true, fellBack: false, error: "" },
   env: NodeJS.ProcessEnv = {
     TELEGRAM_BOT_TOKEN: "bot-token",
     TELEGRAM_DIGEST_CHAT_ID: "555",
+    ASSISTANT_BEARER: "bearer-from-dotenv",
   },
 ) {
   const sent: SendCall[] = [];
@@ -55,10 +80,14 @@ function remindCommand(
       if (agentOutcome === "throw")
         return Promise.reject(new Error("eve unavailable"));
       try {
-        if (agentOutcome === "timeout") await new Promise(() => {});
         if (agentOutcome === "failed")
-          return { status: "failed", message: "ignore me" };
-        if (agentOutcome === "empty") return { status: "waiting", message: "" };
+          return {
+            status: "failed",
+            message: "ignore me",
+            feedback: async () => {},
+          };
+        if (agentOutcome === "empty")
+          return { status: "waiting", message: "", feedback: async () => {} };
         return {
           status: "waiting",
           message: "Короткое напоминание",
@@ -75,7 +104,6 @@ function remindCommand(
         }
       }
     },
-    timeoutMs: 1,
   };
   const cmdRemind = createRemindCommand(
     {
@@ -111,6 +139,10 @@ void test("a failed agent turn sends the raw Reminder once", async () => {
 
   assert.deepEqual(remind.read, [remind.envPath]);
   assert.equal(remind.prompts.length, 1);
+  assert.match(
+    remind.prompts[0],
+    /Reminder fired[\s\S]*Do not send anything yourself/u,
+  );
   assert.deepEqual(remind.sent, [
     ["bot-token", "555", "⏰ Позвонить врачу", { retryTransient: true }],
   ]);
@@ -195,15 +227,16 @@ void test("a session reset failure does not fail a delivered Reminder", async ()
           sessions: {
             create: () =>
               Promise.resolve({
-                response: {
-                  result: () =>
-                    Promise.resolve({
-                      status: "waiting",
-                      message: "Короткое напоминание",
-                    }),
-                },
+                response: fakeTurnResponse([
+                  {
+                    type: "message.completed",
+                    data: { message: "Короткое напоминание" },
+                  },
+                  { type: "session.waiting" },
+                ]),
                 session: {
                   send: () => Promise.resolve(),
+                  cancel: () => Promise.resolve(),
                   reset: ({ reason }) => {
                     resetReasons.push(reason);
                     return Promise.reject(new Error("reset unavailable"));
@@ -216,6 +249,7 @@ void test("a session reset failure does not fail a delivered Reminder", async ()
         Promise.resolve({
           TELEGRAM_BOT_TOKEN: "bot-token",
           TELEGRAM_DIGEST_CHAT_ID: "555",
+          ASSISTANT_BEARER: "bearer-from-dotenv",
         }),
       send: (bot, chat, md, options) => {
         sent.push([bot, chat, md, options]);
@@ -233,6 +267,75 @@ void test("a session reset failure does not fail a delivered Reminder", async ()
   assert.deepEqual(messages, ["Reminder sent to Telegram"]);
 });
 
+void test("the eve client is built from .env, not process.env", async () => {
+  const savedBearer = process.env.ASSISTANT_BEARER;
+  const savedPort = process.env.IVA_PORT;
+  process.env.ASSISTANT_BEARER = "bearer-from-process";
+  process.env.IVA_PORT = "1111";
+  try {
+    const sent: SendCall[] = [];
+    const messages: string[] = [];
+    const captured: ReminderClientOptions[] = [];
+    const base = createCliRuntime(ROOT);
+    const cmdRemind = createRemindCommand(
+      {
+        ...base,
+        ok: (message) => messages.push(message),
+      },
+      {
+        readEnv: () =>
+          Promise.resolve({
+            TELEGRAM_BOT_TOKEN: "bot-token",
+            TELEGRAM_DIGEST_CHAT_ID: "555",
+            ASSISTANT_BEARER: "bearer-from-dotenv",
+            IVA_PORT: "2222",
+          }),
+        createClient: (options) => {
+          captured.push(options);
+          return Promise.resolve({
+            sessions: {
+              create: () =>
+                Promise.resolve({
+                  response: fakeTurnResponse([
+                    {
+                      type: "message.completed",
+                      data: { message: "Короткое напоминание" },
+                    },
+                    { type: "session.waiting" },
+                  ]),
+                  session: {
+                    send: () => Promise.resolve(),
+                    cancel: () => Promise.resolve(),
+                    reset: () => Promise.resolve(),
+                  },
+                }),
+            },
+          });
+        },
+        send: (bot, chat, md, options) => {
+          sent.push([bot, chat, md, options]);
+          return Promise.resolve({ ok: true, fellBack: false, error: "" });
+        },
+      },
+    );
+
+    await cmdRemind(["Проверить", "задачу"]);
+
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].host, "http://127.0.0.1:2222");
+    assert.equal(await captured[0].auth.bearer(), "bearer-from-dotenv");
+    assert.deepEqual(sent, [
+      ["bot-token", "555", "Короткое напоминание", { retryTransient: true }],
+    ]);
+    assert.deepEqual(messages, ["Reminder sent to Telegram"]);
+  } finally {
+    if (savedBearer === undefined) delete process.env.ASSISTANT_BEARER;
+    else process.env.ASSISTANT_BEARER = savedBearer;
+    if (savedPort === undefined) delete process.env.IVA_PORT;
+    else process.env.IVA_PORT = savedPort;
+  }
+});
+
 void test("a missing token or chat fails before the agent turn", async () => {
   for (const { env, expected } of [
     {
@@ -246,6 +349,14 @@ void test("a missing token or chat fails before the agent turn", async () => {
       },
       expected:
         "No target chat — set TELEGRAM_DIGEST_CHAT_ID or TELEGRAM_ALLOWED_USER_IDS in .env",
+    },
+    {
+      env: {
+        TELEGRAM_BOT_TOKEN: "bot-token",
+        TELEGRAM_DIGEST_CHAT_ID: "555",
+        ASSISTANT_BEARER: " ",
+      },
+      expected: "ASSISTANT_BEARER is missing — run: iva doctor",
     },
   ]) {
     const remind = remindCommand(
@@ -261,6 +372,30 @@ void test("a missing token or chat fails before the agent turn", async () => {
   }
 });
 
+void test("a lost agent turn names its cause on stderr and still delivers the raw text", async (t) => {
+  const error = t.mock.method(console, "error");
+
+  for (const { outcome, cause } of [
+    { outcome: "throw", cause: /eve unavailable/u },
+    { outcome: "failed", cause: /status "failed".*ignore me/u },
+    { outcome: "empty", cause: /no text \(status "waiting"\)/u },
+  ] as const) {
+    error.mock.resetCalls();
+    const remind = remindCommand(outcome);
+
+    await remind.cmdRemind(["Позвонить", "врачу"]);
+
+    assert.equal(error.mock.callCount(), 1);
+    const line = error.mock.calls[0].arguments.map(String).join(" ");
+    assert.match(line, /^remind: agent turn failed: /u);
+    assert.match(line, cause);
+    assert.deepEqual(remind.sent, [
+      ["bot-token", "555", "⏰ Позвонить врачу", { retryTransient: true }],
+    ]);
+    assert.deepEqual(remind.messages, ["Reminder sent to Telegram"]);
+  }
+});
+
 const reminderText = fc
   .string({ minLength: 1, maxLength: 60, unit: "grapheme" })
   .filter((value) => value.trim().length > 0);
@@ -269,16 +404,17 @@ const agentOutcome = fc.constantFrom<AgentOutcome>(
   "empty",
   "failed",
   "throw",
-  "timeout",
 );
 
-void test("property: one content send chooses agent text or the raw fallback", async () => {
+void test("property: one content send chooses agent text or the raw fallback", async (t) => {
+  const error = t.mock.method(console, "error");
   await fc.assert(
     fc.asyncProperty(
       reminderText,
       agentOutcome,
       fc.boolean(),
       async (generatedText, outcome, sendOk) => {
+        error.mock.resetCalls();
         const remind = remindCommand(outcome, {
           ok: sendOk,
           fellBack: false,
@@ -304,6 +440,7 @@ void test("property: one content send chooses agent text or the raw fallback", a
           outcome !== "ok",
         );
         assert.equal(thrown === undefined, sendOk);
+        assert.equal(error.mock.callCount(), outcome === "ok" ? 0 : 1);
       },
     ),
     RUNS,

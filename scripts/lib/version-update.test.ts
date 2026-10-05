@@ -11,13 +11,14 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   fixtureProbe,
   fixtureRunner,
 } from "../fixtures/version-update-harness.ts";
+import { MODEL_PROVIDER_NAMES } from "#lib/model-provider.ts";
 import { createVersionStore, layoutFor, releaseOf } from "./version-store.ts";
 import {
   runVersionUpdate,
@@ -411,6 +412,58 @@ test("a customization that builds is layered into the new version", async (t) =>
     "export const mine = 1;\n",
   );
   assert.deepEqual(iva.notices, []);
+});
+
+test("a markdown rule file in the slot is live, not built", async (t) => {
+  const iva = world(t);
+  customFile(iva.home, "agent/instructions/rules.md", "- mine\n");
+
+  const stock = updated(await iva.update());
+  assert.equal(stock.custom, "none");
+  assert.equal(
+    existsSync(join(iva.home, "current/agent/instructions/rules.md")),
+    false,
+  );
+  assert.deepEqual(iva.notices, []);
+
+  // Правка живого правила не рождает новую Version: дайджест слоя её не видит.
+  customFile(iva.home, "agent/instructions/rules.md", "- mine\n- also mine\n");
+  assert.deepEqual(await iva.update(), {
+    status: "current",
+    version: stock.version,
+  });
+
+  // Файл слота с кодом по-прежнему проходит через сборку.
+  customFile(iva.home, "agent/instructions/30-mine.ts", "export default 1;\n");
+  const applied = updated(await iva.update());
+  assert.equal(applied.custom, "applied");
+  assert.equal(
+    readFileSync(
+      join(iva.home, "current/agent/instructions/30-mine.ts"),
+      "utf8",
+    ),
+    "export default 1;\n",
+  );
+});
+
+test("a slot file with a bundled name refuses the version and keeps the running one", async (t) => {
+  const iva = world(t);
+  const first = updated(await iva.update());
+  mkdirSync(join(iva.repo, "agent/instructions"), { recursive: true });
+  writeFileSync(
+    join(iva.repo, "agent/instructions/20-core.ts"),
+    "export default 1;\n",
+  );
+  iva.release("0.3.15");
+  customFile(iva.home, "agent/instructions/20-core.ts", "export default 2;\n");
+
+  await assert.rejects(
+    iva.update(),
+    /collides with a bundled file: agent\/instructions\/20-core\.ts/u,
+  );
+  const store = createVersionStore(iva.home);
+  assert.equal(store.currentName(), first.version);
+  assert.deepEqual(readdirSync(store.layout.versions), [first.version]);
 });
 
 test("the custom layer's own bookkeeping is not mistaken for the user's code", async (t) => {
@@ -811,7 +864,10 @@ export default function up(context) {
         return Promise.resolve();
       },
       run: async (command, args, cwd) => {
-        if (command === "uv") {
+        if (
+          command === process.execPath &&
+          args[0]?.endsWith("scripts/vault-cleanup.ts")
+        ) {
           order.push("cleanup");
           assert.equal(
             createVersionStore(iva.home).currentName(),
@@ -1292,15 +1348,170 @@ test("the chores of the installation are run around the restart, out of the vers
   // frontmatter writer grew to gigabytes, and once the agent has them open the
   // repair is too late. The Google CLI is refreshed after everything else.
   assert.deepEqual(calls.slice(-3), [
-    `uv run ${join(dir, "scripts/autograph/cleanup.py")} . --apply @${layout.vault}`,
+    `${process.execPath} ${join(dir, "scripts/vault-cleanup.ts")} . --apply @${layout.vault}`,
     `restart @${layout.current}`,
-    `npm i -g @googleworkspace/cli@latest @${dir}`,
+    `npm i -g --prefix ${join(homedir(), ".local")} @googleworkspace/cli@latest @${dir}`,
   ]);
   assert.equal(createVersionStore(iva.home).settled(), outcome.version);
   assert.ok(
-    logged.some((message) => /Google CLI update did not run/.test(message)),
+    logged.some((message) =>
+      /Google CLI update did not run \(exit 1: no registry\)/.test(message),
+    ),
     logged.join("\n"),
   );
+});
+
+test("Google update uses the service user's prefix and preserves existing authorization", async (t) => {
+  const iva = world(t);
+  const previousHome = process.env.HOME;
+  const serviceHome = join(iva.home, "user with spaces");
+  const config = join(serviceHome, ".config/gws/credentials.json");
+  mkdirSync(dirname(config), { recursive: true });
+  writeFileSync(config, "synthetic-authorization\n");
+  process.env.HOME = serviceHome;
+  t.after(() => {
+    process.env.HOME = previousHome;
+  });
+  const build = fixtureRunner();
+  const seen: string[][] = [];
+  updated(
+    await iva.update({
+      run: (command, args, cwd) => {
+        if (
+          command === "npm" &&
+          args.at(-1) === "@googleworkspace/cli@latest"
+        ) {
+          seen.push([...args]);
+          return Promise.resolve({ code: 0, output: "" });
+        }
+        return build(command, args, cwd);
+      },
+    }),
+  );
+  assert.deepEqual(seen, [
+    [
+      "i",
+      "-g",
+      "--prefix",
+      join(serviceHome, ".local"),
+      "@googleworkspace/cli@latest",
+    ],
+  ]);
+  assert.equal(readFileSync(config, "utf8"), "synthetic-authorization\n");
+});
+
+test("an errand without output names the exit code alone", async (t) => {
+  const iva = world(t);
+  const logged: string[] = [];
+  const build = fixtureRunner();
+  updated(
+    await iva.update({
+      log: (message) => logged.push(message),
+      run: (command, args, cwd) =>
+        command === process.execPath &&
+        args[0]?.endsWith("scripts/vault-cleanup.ts")
+          ? Promise.resolve({ code: 127, output: "\n  \n" })
+          : build(command, args, cwd),
+    }),
+  );
+  assert.ok(
+    logged.some((message) =>
+      /the vault cleanup did not run \(exit 127\); the update continues without it/.test(
+        message,
+      ),
+    ),
+    logged.join("\n"),
+  );
+});
+
+test("the vault cleanup leaves a commit pair named after the version, and git cannot fail the update", async (t) => {
+  const iva = world(t);
+  const layout = layoutFor(iva.home);
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-c", "core.quotePath=false", ...args], {
+      cwd: layout.vault,
+      encoding: "utf8",
+    }).trim();
+  const vaultGit = (...args: string[]) => {
+    mkdirSync(layout.vault, { recursive: true });
+    return git(...args);
+  };
+  vaultGit("init", "-q", "-b", "main");
+  vaultGit("config", "user.email", "vault@example.com");
+  vaultGit("config", "user.name", "Vault");
+  writeFileSync(join(layout.vault, "CORE.md"), "# CORE\n");
+  vaultGit("add", "-A");
+  vaultGit("commit", "-q", "-m", "vault");
+  // Правка владельца в Obsidian, ещё не в истории: она уезжает в снимок «до», а не теряется.
+  writeFileSync(join(layout.vault, "CORE.md"), "# CORE\n\nправка владельца\n");
+
+  const build = fixtureRunner();
+  const outcome = updated(
+    await iva.update({
+      run: (command, args, cwd) => {
+        if (
+          command !== process.execPath ||
+          !args[0]?.endsWith("scripts/vault-cleanup.ts")
+        )
+          return build(command, args, cwd);
+        // Чистка чинит карточку, раздутое старшее описание: правка vault мимо инструментов.
+        writeFileSync(join(layout.vault, "карточка.md"), "# Починено\n");
+        return Promise.resolve({ code: 0, output: "" });
+      },
+    }),
+  );
+  assert.deepEqual(git("log", "--pretty=%s").split("\n").slice(0, 2), [
+    `update ${outcome.version}: vault cleanup`,
+    `update ${outcome.version}: vault snapshot`,
+  ]);
+  // Снимок «до» держит чужую правку, коммит чистки - результат чистки.
+  assert.match(git("show", "--name-only", "--pretty=", "HEAD~1"), /CORE\.md/u);
+  assert.match(
+    git("show", "--name-only", "--pretty=", "HEAD"),
+    /карточка\.md/u,
+  );
+  assert.equal(git("status", "--porcelain"), "");
+});
+
+test("a vault that is not a repository does not fail the update", async (t) => {
+  const iva = world(t);
+  const outcome = updated(await iva.update());
+  assert.ok(outcome.version.startsWith(iva.target.version));
+  assert.equal(createVersionStore(iva.home).settled(), outcome.version);
+});
+
+test("миграции получают каталог data, а не vault", async (t) => {
+  const iva = world(t);
+  writeFileSync(
+    join(iva.repo, "scripts/migrations/002-context.ts"),
+    `import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+export default async function up(context) {
+  writeFileSync(join(context.dataDir, "migration-context.json"), JSON.stringify(context));
+}
+`,
+  );
+  iva.release("0.3.15");
+  const outcome = updated(await iva.update());
+  const layout = layoutFor(iva.home);
+  const context = JSON.parse(
+    readFileSync(join(layout.data, "migration-context.json"), "utf8"),
+  ) as Record<string, string>;
+  // Миграция — код обновления, а память — чужие данные: ключи ровно эти три, и
+  // каталог vault в них не назван ни одним способом.
+  assert.deepEqual(Object.keys(context).sort(), [
+    "dataDir",
+    "home",
+    "versionDir",
+  ]);
+  assert.equal(context.dataDir, layout.data);
+  for (const value of Object.values(context))
+    assert.ok(
+      !value.includes(layout.vault),
+      `миграция получила путь vault: ${value}`,
+    );
+  assert.equal(existsSync(join(layout.vault, "migration-context.json")), false);
+  assert.ok(outcome.version.startsWith(iva.target.version));
 });
 
 test("a healthy service stays committed when post-health cleanup fails", async (t) => {
@@ -1385,7 +1596,8 @@ test("old versions go before the Google CLI errand", async (t) => {
     run: (command, args, cwd) => {
       if (
         command === "npm" &&
-        args.join(" ") === "i -g @googleworkspace/cli@latest"
+        args[0] === "i" &&
+        args.at(-1) === "@googleworkspace/cli@latest"
       ) {
         inspected = true;
         assert.ok(store.list().length <= 2, store.list().join(", "));
@@ -1737,7 +1949,11 @@ test("the new version refuses to build on an invalid MODEL_PROVIDER", async (t) 
       new RegExp(`Invalid MODEL_PROVIDER "${value}"`),
       value,
     );
-    assert.match(outcome.message ?? "", /ollama, opencode, codex, openrouter/u);
+    // Список имён берётся у рантайма: вписанный сюда рукой устаревает на первом вендоре.
+    assert.ok(
+      (outcome.message ?? "").includes(MODEL_PROVIDER_NAMES.join(", ")),
+      value,
+    );
     assert.match(outcome.message ?? "", /iva config/u);
     // Ни замка, ни установки версии: до сборки дело не дошло.
     assert.equal(existsSync(join(home, "versions")), false, value);

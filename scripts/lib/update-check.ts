@@ -11,7 +11,8 @@ import {
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { notificationChat } from "./notification-chat.ts";
-import { resolveUpdateTarget, type GitResult } from "./update-channel.ts";
+import { button, escapeRichText, screenPayload } from "./telegram-buttons.ts";
+import { resolveReleaseTarget, type GitResult } from "./update-channel.ts";
 
 export { notificationChat };
 
@@ -21,7 +22,8 @@ export type GitCommand = (
 ) => Promise<GitResult | string>;
 type UpdateOffer = {
   text: string;
-  replyMarkup: { inline_keyboard: { text: string; callback_data: string }[][] };
+  // Кнопки — последний абзац text; отдаются отдельно, чтобы вставить блок между телом и ними.
+  actions: string;
 };
 type TelegramResponse = {
   ok: boolean;
@@ -97,6 +99,17 @@ export function compareStableVersions(
     if (remote[i] < local[i]) return -1;
   }
   return 0;
+}
+
+/** Как compareStableVersions, но установленный пререлиз (бета X.Y.Z-…) — чуть младше
+ * своего релиза X.Y.Z: сравнивается его ядро. */
+function compareInstalled(
+  installed: string | null,
+  other: string | null,
+): number | null {
+  const core = String(installed).replace(/-[0-9A-Za-z.-]+$/u, "");
+  const bare = compareStableVersions(core, other);
+  return bare === 0 && core !== installed ? 1 : bare;
 }
 
 /** The file a release uses to name the oldest CLI that can install it. */
@@ -188,7 +201,7 @@ export async function updaterCompat(
 ): Promise<UpdaterCompat> {
   const minUpdater = await readMinUpdater(git, commit);
   if (!minUpdater) return { status: "ok" };
-  const comparison = compareStableVersions(own, minUpdater);
+  const comparison = compareInstalled(own, minUpdater);
   if (comparison === null)
     throw new Error(
       `cannot compare the installed release ${JSON.stringify(own)} with minUpdater ${JSON.stringify(minUpdater)}`,
@@ -234,24 +247,22 @@ export async function inspectUpstream({
       ? { code: 0, stdout: result, stderr: "" }
       : result;
   };
-  const target = await resolveUpdateTarget({ git: run, remote });
   const local = await requireGit(gitImpl, root, ["rev-parse", head]);
-  const remoteHead = target.targetHead ?? "";
-  const behind =
-    Number(
-      await requireGit(gitImpl, root, [
-        "rev-list",
-        "--count",
-        `${head}..${remoteHead}`,
-      ]),
-    ) || 0;
+  // Цель: выпуск (метка) или вершина при бета-обновлениях; ниже установленного — никогда.
+  const target = await resolveReleaseTarget({
+    git: run,
+    remote,
+    installed: local,
+  });
+  const remoteHead = target.targetHead;
+  const behind = await commitsBehind(gitImpl, root, `${head}..${remoteHead}`);
   const localVersion = packageVersion(
     await requireGit(gitImpl, root, ["show", `${head}:package.json`]),
   );
   const remoteVersion = packageVersion(
     await requireGit(gitImpl, root, ["show", `${remoteHead}:package.json`]),
   );
-  const versionComparison = compareStableVersions(localVersion, remoteVersion);
+  const versionComparison = compareInstalled(localVersion, remoteVersion);
   const hasCommitUpdate = behind > 0 && local !== remoteHead;
   const hasVersionUpdate = hasCommitUpdate && versionComparison === 1;
   // The same marker both updaters read, from the ref this call already fetched: an
@@ -263,6 +274,7 @@ export async function inspectUpstream({
     localVersion ?? undefined,
   );
   const common = {
+    beta: target.beta,
     branch: target.branch,
     currentBranch: target.currentBranch,
     legacyMigration: target.legacyMigration,
@@ -274,17 +286,51 @@ export async function inspectUpstream({
     hasCommitUpdate,
     updaterTooOld: compat.status === "too-old",
   };
-  if (hasVersionUpdate && remoteVersion !== null) {
-    return {
-      ...common,
-      remoteVersion,
-      hasVersionUpdate: true as const,
-    };
-  }
-  return {
-    ...common,
-    hasVersionUpdate: false as const,
-  };
+  return withVersionUpdate(common, hasVersionUpdate, remoteVersion);
+}
+
+/** Сколько коммитов в диапазоне; нечисло — ноль. */
+async function commitsBehind(gitImpl: GitCommand, root: string, range: string) {
+  return (
+    Number(await requireGit(gitImpl, root, ["rev-list", "--count", range])) || 0
+  );
+}
+
+/** Итог проверки: новая версия есть только с известным номером. */
+function withVersionUpdate<T extends object>(
+  common: T,
+  hasVersionUpdate: boolean,
+  remoteVersion: string | null,
+) {
+  if (hasVersionUpdate && remoteVersion !== null)
+    return { ...common, remoteVersion, hasVersionUpdate: true as const };
+  return { ...common, hasVersionUpdate: false as const };
+}
+
+/**
+ * Строки «кнопка — что она делает» для предложения обновления. Одна сборка на оба
+ * экрана, которые его показывают: ежедневный Alert (updateOffer) и /update в мосте.
+ * `what` — что именно поставит кнопка: «v0.4.2» или «новую сборку», когда номер тот же.
+ */
+export function updateOfferActionLines(locale: string, what: string): string {
+  const ru = locale === "ru";
+  const update = ru ? "⬆️ Обновить" : "⬆️ Update";
+  const later = ru ? "Позже" : "Later";
+  return [
+    `${button(update, "iva_update:do", "success")} — ${ru ? `поставить ${what}` : `install ${what}`}`,
+    `${button(later, "iva_update:skip")} — ${ru ? "напомню завтра" : "I'll remind you tomorrow"}`,
+  ].join("\n\n");
+}
+
+/**
+ * Что обновление действительно оставляет на месте, одной строкой на оба экрана
+ * предложения. Правки в коде Ивы оно не переносит: версия ставится из коммита
+ * (решение владельца 13.09.2026), и обещать обратное нельзя.
+ */
+export function updateKeepsLine(locale: string): string {
+  return locale === "ru"
+    ? "Настройки, память и ваши скиллы на месте. Правки в коде Ивы не переносятся."
+    : "Settings, memory and your skills stay in place. Edits to Iva's own code are not carried over.";
 }
 
 export function updateOffer(
@@ -297,27 +343,53 @@ export function updateOffer(
 ): UpdateOffer {
   const ru = locale === "ru";
   const head = ru
-    ? `⬆️ Доступна новая версия Ивы\n\nv${localVersion} → v${remoteVersion}`
-    : `⬆️ A new Iva version is available\n\nv${localVersion} → v${remoteVersion}`;
+    ? `⬆️ Доступна новая версия Ивы\n\nv${escapeRichText(String(localVersion))} → v${escapeRichText(String(remoteVersion))}`
+    : `⬆️ A new Iva version is available\n\nv${escapeRichText(String(localVersion))} → v${escapeRichText(String(remoteVersion))}`;
   const tail = updaterTooOld
     ? repairInstructions(locale)
-    : ru
-      ? "Настройки и локальные изменения будут сохранены."
-      : "Settings and local changes will be preserved.";
+    : updateKeepsLine(locale);
+  // Кнопки — строки самого сообщения: каждая рядом со своим пояснением (контракт rich).
+  const actions = updateOfferActionLines(
+    locale,
+    `v${escapeRichText(String(remoteVersion))}`,
+  );
   return {
-    text: `${head}\n${tail}`,
-    replyMarkup: {
-      inline_keyboard: [
-        [
-          {
-            text: ru ? "⬆️ Обновить" : "⬆️ Update",
-            callback_data: "iva_update:do",
-          },
-          { text: ru ? "Позже" : "Later", callback_data: "iva_update:skip" },
-        ],
-      ],
-    },
+    text: `${head}\n\n${tail}\n\n${actions}`,
+    actions,
   };
+}
+
+/** Заголовки строк CHANGELOG `Unreleased` (эмодзи и жирный заголовок), не больше пяти. */
+function unreleasedHeadlines(changelog: string): string[] {
+  const section =
+    changelog.split(/^## /mu).find((part) => part.startsWith("[Unreleased]")) ??
+    "";
+  return [...section.matchAll(/^- (\S+) \*\*(.+?)\*\*/gmu)]
+    .slice(0, 5)
+    .map(([, emoji, title]) => `${emoji} ${title}`);
+}
+
+/** Alert бета-обновлений: новая сборка ветки — её версия и что в ней из CHANGELOG.
+ * Обновлятор установки старше нужного сборке — вместо кнопки инструкция ремонта. */
+export function betaOffer(
+  version: string,
+  changelog: string,
+  locale = "en",
+  updaterTooOld = false,
+): UpdateOffer {
+  const ru = locale === "ru";
+  const head = `${ru ? "🧪 Новая бета-сборка Ивы" : "🧪 A new Iva beta build"}\n\nv${escapeRichText(version)}`;
+  const news = unreleasedHeadlines(changelog)
+    .map((line) => `• ${escapeRichText(line)}`)
+    .join("\n");
+  const actions = updaterTooOld
+    ? ""
+    : updateOfferActionLines(locale, ru ? "бета-сборку" : "the beta build");
+  const tail = updaterTooOld
+    ? repairInstructions(locale)
+    : updateKeepsLine(locale);
+  const parts = [head, news, tail, actions];
+  return { text: parts.filter(Boolean).join("\n\n"), actions };
 }
 
 export async function sendUpdateOffer({
@@ -332,16 +404,15 @@ export async function sendUpdateOffer({
   fetchImpl?: TelegramFetch;
 } = {}): Promise<unknown> {
   if (!offer) throw new Error("update offer is required");
+  // Стиль меню владельца: rich message или обычный текст с клавиатурой (classic).
+  const payload = screenPayload(offer.text);
+  const method = "rich_message" in payload ? "sendRichMessage" : "sendMessage";
   const response = await fetchImpl(
-    `https://api.telegram.org/bot${token}/sendMessage`,
+    `https://api.telegram.org/bot${token}/${method}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: offer.text,
-        reply_markup: offer.replyMarkup,
-      }),
+      body: JSON.stringify({ chat_id: chatId, ...payload }),
     },
   );
   const data: { ok?: boolean; result?: unknown; description?: string } =

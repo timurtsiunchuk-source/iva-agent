@@ -10,8 +10,15 @@ import { POST } from "eve/channels";
 import {
   noticeSender,
   sendThroughOutbox,
+  type OutboxAck,
   type OutboxTransport,
 } from "../lib/outbox.js";
+import { hasRichButtons } from "../lib/telegram-format.js";
+import { parseTelegramDelivery } from "../lib/telegram-delivery.js";
+import {
+  TELEGRAM_RICH_REPLIES,
+  type RichReplies,
+} from "../lib/telegram-rich-replies.js";
 // Inbound-пайплайн — единственный вход внутрь: allowlist, решение о диспатче,
 // запись в Vault, медиа со зрением и транскрипцией, inbound-Gate и контекст хода.
 // Канал приносит ему эффекты и сам про разбор входящего ничего не знает.
@@ -46,6 +53,20 @@ import {
   TELEGRAM_CANCEL_ROUTE,
 } from "../lib/telegram-cancel-route.js";
 import { handleTelegramStopCallback } from "../lib/telegram-stop.js";
+// Свёртка между ходами: история пересказывается, пока человек ничего не ждёт, а чат на
+// это время занят записью running + compacting (agent/lib/idle-compaction.ts).
+import {
+  localSessionCompactUrl,
+  requestSessionCompact,
+} from "../lib/eve-compact.js";
+import {
+  closeIdleCompactionTurn,
+  dropIdleCompactionTurn,
+  endIdleCompaction,
+  openIdleCompactionTurn,
+  startIdleCompaction,
+} from "../lib/idle-compaction.js";
+import { providerConfig } from "../provider.js";
 import {
   handleAcceptedTelegramWebhook,
   TELEGRAM_ACCEPTANCE_ROUTE,
@@ -53,11 +74,13 @@ import {
 } from "../lib/telegram-acceptance.js";
 import {
   abandonTelegramEarlyStatus,
+  chatTakeOverPatch,
   emitTelegramTurnLatency,
   markTelegramFirstOutput,
   markTelegramTurnAlive,
   publishTelegramEarlyStatus,
   publishTelegramTurnStarted,
+  takeOverTelegramChat,
 } from "../lib/telegram-turn-start.js";
 
 // Токен (TELEGRAM_BOT_TOKEN) и секрет вебхука (TELEGRAM_WEBHOOK_SECRET_TOKEN)
@@ -71,43 +94,23 @@ import {
 // eve из RouteHandlerArgs (agent/lib/eve-cancel.ts). Дальше eve абортит ход и присылает
 // turn.cancelled, который правит статус-сообщение.
 
-// Транспорт Outbox для канала: доставка через хендл eve. Что и в каком виде отдавать,
-// решает шов (agent/lib/outbox.ts) — здесь только вызовы Bot API и логи отказов.
+/**
+ * Creates an Outbox transport that delivers a Telegram reply through Eve.
+ *
+ * The Outbox seam selects the rendered form; this transport performs Bot API calls,
+ * records delivery failures, and preserves the requested quiet-delivery mode.
+ */
+// Что и в каком виде отдавать, решает шов (agent/lib/outbox.ts).
 // stop канал не выставляет намеренно: ответ в диалоге короткий, и упавший кусок
 // не повод молчать остальными. Обрыв хвоста — про ночные отчёты, не про разговор.
-function outboxTransport(
+// При TELEGRAM_RICH_REPLIES=never ключа sendRich в транспорте нет вовсе, и шов
+// (agent/lib/outbox.ts) сам уходит HTML-путём.
+export function outboxTransport(
   tg: Pick<TelegramHandle, "chatId" | "messageThreadId" | "request" | "post">,
+  richReplies: RichReplies,
+  silent = false,
 ): OutboxTransport {
-  return {
-    // Rich message (sendRichMessage, Bot API 10.1): таблицы/таск-листы/<details>/формулы
-    // рендерятся нативно — HTML-путь так не умеет. Любая ошибка (старый Bot API, парс,
-    // лимит 32768, RICH_MESSAGE_*) уводит шов в HTML-путь, то есть в поведение до rich.
-    // request() = raw Bot API call, транспорт JSON, поэтому rich_message шлём объектом.
-    async sendRich(markdown) {
-      try {
-        const res = await tg.request("sendRichMessage", {
-          chat_id: tg.chatId,
-          rich_message: { markdown },
-          ...(tg.messageThreadId !== undefined
-            ? { message_thread_id: tg.messageThreadId }
-            : {}),
-        });
-        if (res.ok) return { ok: true };
-        console.error(
-          "[telegram] sendRichMessage отвергнут, фолбэк HTML:",
-          res.status,
-          JSON.stringify(res.body).slice(0, 300),
-        );
-        return {
-          ok: false,
-          error: `sendRichMessage ${res.status}`,
-          retryPlain: false,
-        };
-      } catch (err) {
-        console.error("[telegram] sendRichMessage упал, фолбэк HTML:", err);
-        return { ok: false, error: String(err), retryPlain: false };
-      }
-    },
+  const transport: OutboxTransport = {
     async sendHtml(html) {
       try {
         // eve's TelegramMessageBody type omits parse_mode, но рантайм
@@ -116,6 +119,7 @@ function outboxTransport(
         await tg.post({
           text: html,
           parse_mode: "HTML",
+          ...(silent ? { disable_notification: true } : {}),
         } as TelegramMessageBody & { parse_mode: "HTML" });
         return { ok: true };
       } catch (err) {
@@ -130,7 +134,7 @@ function outboxTransport(
     },
     async sendPlain(text) {
       try {
-        await tg.post(text);
+        await tg.post(silent ? { text, disable_notification: true } : text);
         return { ok: true };
       } catch (e2) {
         console.error("[telegram] plain-фолбэк тоже упал:", e2);
@@ -138,6 +142,51 @@ function outboxTransport(
       }
     },
   };
+  // Rich message (sendRichMessage, Bot API 10.1): таблицы/таск-листы/<details>/формулы/
+  // кнопки рендерятся нативно — HTML-путь так не умеет. Любая ошибка (старый Bot API,
+  // парс, лимит 32768, RICH_MESSAGE_*) уводит шов в HTML-путь, то есть в поведение до
+  // rich. request() = raw Bot API call, транспорт JSON, поэтому rich_message шлём объектом.
+  const sendRich = async (markdown: string): Promise<OutboxAck> => {
+    try {
+      const res = await tg.request("sendRichMessage", {
+        chat_id: tg.chatId,
+        rich_message: { markdown },
+        ...(tg.messageThreadId !== undefined
+          ? { message_thread_id: tg.messageThreadId }
+          : {}),
+        ...(silent ? { disable_notification: true } : {}),
+      });
+      if (res.ok) return { ok: true };
+      console.error(
+        "[telegram] sendRichMessage отвергнут, фолбэк HTML:",
+        res.status,
+        JSON.stringify(res.body).slice(0, 300),
+      );
+      return {
+        ok: false,
+        error: `sendRichMessage ${res.status}`,
+        retryPlain: false,
+      };
+    } catch (err) {
+      console.error("[telegram] sendRichMessage упал, фолбэк HTML:", err);
+      return { ok: false, error: String(err), retryPlain: false };
+    }
+  };
+  // TELEGRAM_RICH_REPLIES=never держит таблицы и прочее на HTML-пути, но кнопка живёт
+  // только в rich-сообщении (ADR-0015): ответ с <tg-button> уходит rich в любом режиме,
+  // иначе тег доехал бы до чата текстом.
+  transport.sendRich =
+    richReplies === "auto"
+      ? sendRich
+      : async (markdown) =>
+          hasRichButtons(markdown)
+            ? sendRich(markdown)
+            : {
+                ok: false,
+                error: "TELEGRAM_RICH_REPLIES=never",
+                retryPlain: false,
+              };
+  return transport;
 }
 
 // Пульс живого хода в run-status: без него жнец моста снимал молчаливый длинный ход
@@ -157,6 +206,45 @@ function keepTurnAlive(
   });
 }
 
+let bearerMissingLogged = false;
+
+// Занять свободный чат под пересказ между ходами — тем же захватом, что ход и напоминание.
+// Живой чужой ход (успело прийти сообщение) и сброшенную сессию (/new оставляет resetAt) не
+// трогаем: пересказа не будет. Без общего токена eve откажет: чат не занимаем, а причину
+// один раз пишем в журнал.
+async function claimChatForCompaction(
+  chatKey: string,
+  sessionId: string,
+  bearer: string | undefined,
+): Promise<boolean> {
+  if (!bearer) {
+    if (!bearerMissingLogged)
+      console.error(
+        "[telegram] свёртка между ходами выключена: нет ASSISTANT_BEARER — run: iva doctor",
+      );
+    bearerMissingLogged = true;
+    return false;
+  }
+  return takeOverTelegramChat({
+    chatKey,
+    patch: chatTakeOverPatch({ sessionId, compacting: true }),
+    staleMs: RUN_STALE_MS,
+    getStatusImpl: getChatStatus,
+    setStatusIfImpl: setChatStatusIf,
+    refuseImpl: (status) => status?.resetAt !== undefined,
+    onWorkingStatusError: (error) =>
+      console.error("[telegram] чат под свёртку между ходами не занят:", error),
+  });
+}
+
+// Освободить чат после отказа eve: только свою запись пересказа, не запись начавшегося хода.
+const releaseCompactionClaim = (chatKey: string, sessionId: string) =>
+  setChatStatusIf(
+    chatKey,
+    { sessionId, compacting: true },
+    { status: "idle", sessionId: null, compacting: null },
+  );
+
 const telegram = telegramChannel({
   botUsername: process.env.TELEGRAM_BOT_USERNAME ?? "my_bot",
   // Картинку/файл НЕ суём в запрос к модели (это и ломалось: octet-stream → reject, потом
@@ -172,6 +260,12 @@ const telegram = telegramChannel({
   // ВАЖНО: наличие этого хука закрывает дефолтную ветку eve НАВСЕГДА — «Unsupported
   // action.» на не-HITL колбэки больше не отправляется. Поэтому чужой колбэк гасим
   // сами пустым answerCallbackQuery: иначе у нажавшего вечный спиннер на кнопке.
+  //
+  // Кнопки, написанные моделью, в long-poll до этого хука не доходят вовсе: мост
+  // превращает тап в обычное сообщение (scripts/poller/control.ts) и отдаёт его
+  // inbound pipeline — подать сообщение в сессию каналу нечем, у него только Bot API,
+  // а inbound pipeline читает сообщения. В webhook-режиме (моста нет) такой тап
+  // остаётся без доставки: здесь он только гаснет.
   onCallbackQuery: async (ctx, query) => {
     const ack = async (text?: string) => {
       try {
@@ -187,13 +281,23 @@ const telegram = telegramChannel({
       await ack();
       return;
     }
-    await handleTelegramStopCallback(query, { ackImpl: ack });
+    // Моста в этом режиме нет, поэтому о неостановленном ходе канал говорит сам: текст
+    // уходит уже после ответа на колбэк. Кнопки рестарта тут нет — рестарт делает мост.
+    const chatId = query.message?.chat?.id;
+    await handleTelegramStopCallback(query, {
+      ackImpl: ack,
+      notifyImpl: async (text) => {
+        if (chatId === undefined) return;
+        await ctx.telegram.request("sendMessage", { chat_id: chatId, text });
+      },
+    });
   },
   events: {
     // Начало хода: сначала публикуем running, затем отправляем медленное статус-сообщение.
     // FIFO-мост не должен успеть принять следующую голову, пока Bot API отвечает.
     async "turn.started"(data, channel, ctx) {
       const tg = channel.telegram;
+      openIdleCompactionTurn(ctx.session.id);
       await publishTelegramTurnStarted({
         chatKey: chatKeyOf(tg.chatId, tg.messageThreadId),
         sessionId: ctx.session.id,
@@ -212,17 +316,64 @@ const telegram = telegramChannel({
           console.error("[telegram] статус-сообщение не отправилось:", error),
       });
     },
+    // Решение о свёртке от уборки статуса не зависит: её сбой не отменяет пересказ.
     async "turn.completed"(_data, channel, ctx) {
-      await finishTelegramStatus(channel, ctx.session.id, "completed");
+      try {
+        await finishTelegramStatus(channel, ctx.session.id, "completed");
+      } finally {
+        closeIdleCompactionTurn(ctx.session.id, providerConfig.contextWindow);
+      }
     },
+    // Отмена во время пересказа между ходами (/stop) — не отмена хода: чат просто свободен,
+    // отметки «ход отменён» следующему сообщению не оставляем.
     async "turn.cancelled"(_data, channel, ctx) {
-      await finishTelegramStatus(channel, ctx.session.id, "cancelled");
+      const tg = channel.telegram;
+      const status = getChatStatus(chatKeyOf(tg.chatId, tg.messageThreadId));
+      const compacting =
+        status?.status === "running" && status.compacting === true;
+      try {
+        await finishTelegramStatus(
+          channel,
+          ctx.session.id,
+          compacting ? "completed" : "cancelled",
+        );
+      } finally {
+        dropIdleCompactionTurn(ctx.session.id);
+      }
     },
-    // Страховка: если терминальное turn-событие потерялось (краш), парковка сессии
-    // снимает busy-флаг И удаляет осиротевший «Работаю…» — та же уборка, что у
-    // turn.completed. После обычного финала CAS по sessionId не совпадает — no-op.
+    // Парковка сессии. После хода: если он дошёл до порога, занять чат и попросить eve
+    // пересказать историю (agent/lib/idle-compaction.ts). После пересказа — успеха, сбоя или
+    // обрыва — eve паркует сессию снова, и та же уборка освобождает чат.
+    // Она же страховка: если терминальное turn-событие потерялось (краш), парковка снимает
+    // busy-флаг и удаляет осиротевший «Работаю…». После обычного финала CAS по sessionId
+    // не совпадает — no-op.
     async "session.waiting"(_data, channel, ctx) {
-      await finishTelegramStatus(channel, ctx.session.id, "completed");
+      const sessionId = ctx.session.id;
+      const chatKey = chatKeyOf(
+        channel.telegram.chatId,
+        channel.telegram.messageThreadId,
+      );
+      const bearer = process.env.ASSISTANT_BEARER?.trim();
+      try {
+        const parked = getChatStatus(chatKey);
+        // Парковка застала запись пересказа этой сессии: он кончился.
+        if (parked?.sessionId === sessionId && parked.compacting === true)
+          endIdleCompaction(sessionId);
+        await finishTelegramStatus(channel, sessionId, "completed");
+      } finally {
+        // Ждём ответа eve: она ждёт этот обработчик, поэтому просьба встаёт в её очередь
+        // раньше, чем она возьмёт следующее сообщение, и пересказ идёт под записью.
+        await startIdleCompaction({
+          sessionId,
+          claimImpl: () => claimChatForCompaction(chatKey, sessionId, bearer),
+          requestImpl: (id) =>
+            requestSessionCompact({
+              url: localSessionCompactUrl(id),
+              bearer: bearer ?? "",
+            }),
+          releaseImpl: () => releaseCompactionClaim(chatKey, sessionId),
+        });
+      }
     },
     "message.appended"(_data, channel, ctx) {
       markTelegramFirstOutput({
@@ -255,11 +406,12 @@ const telegram = telegramChannel({
     // Ответ модели уходит через Outbox — он же переопределяет дефолтную plain-доставку
     // eve. Промежуточный текст перед tool-calls не шлём (зеркалим дефолт). Повторного
     // хода модели на сбой доставки нет — ход уже закрыт, реформат произойдёт на следующем
-    // сообщении (ошибка видна в логе/vault). Латентность засчитываем, только если ушло
-    // хотя бы одно сообщение и ни одно не потерялось.
+    // сообщении (ошибка видна в логе/vault). Латентность засчитываем, только если ни одно
+    // сообщение не потерялось: пустой рендер шов отдаёт с ok=false, поэтому проверки
+    // delivered у вызывающего больше нет.
     async "message.completed"(data, channel, ctx) {
       if (data.finishReason === "tool-calls" || !data.message) return;
-      const message = data.message;
+      const { text: message, silent } = parseTelegramDelivery(data.message);
       const recordDelivery = (delivered: boolean) =>
         emitTelegramTurnLatency({
           chatKey: chatKeyOf(
@@ -282,13 +434,19 @@ const telegram = telegramChannel({
           source: "telegram",
         },
         message,
-        () => sendThroughOutbox(message, outboxTransport(channel.telegram)),
+        () =>
+          sendThroughOutbox(
+            message,
+            outboxTransport(channel.telegram, TELEGRAM_RICH_REPLIES, silent),
+          ),
       );
-      if (result.delivered > 0 && result.ok) recordDelivery(true);
+      if (!result.ok) return;
+      recordDelivery(true);
     },
     // Ход упал: статус прибираем по CAS, но сообщение об ошибке от него не гейтим —
     // позднее terminal-событие всё равно должно объяснить пользователю, что произошло.
     async "turn.failed"(data, channel, ctx) {
+      dropIdleCompactionTurn(ctx.session.id);
       try {
         await finishTelegramStatus(channel, ctx.session.id, "failed");
       } catch {
@@ -296,6 +454,7 @@ const telegram = telegramChannel({
       }
       await notifyTelegramFailure(
         ctx.session.id,
+        data.turnId,
         data,
         noticeSender((text) => channel.telegram.sendMessage(text)),
       );
@@ -312,6 +471,7 @@ const telegram = telegramChannel({
       }
       await notifyTelegramFailure(
         data.sessionId,
+        null,
         data,
         noticeSender((text) => channel.telegram.sendMessage(text)),
       );

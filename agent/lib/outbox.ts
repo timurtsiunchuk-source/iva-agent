@@ -34,6 +34,7 @@ import { traceOutboundGate } from "./trace.ts";
 import {
   htmlToPlain,
   needsRichMessage,
+  withButtonTypes,
   toTelegramHtmlChunks,
 } from "./telegram-format.ts";
 
@@ -121,7 +122,7 @@ export async function sendThroughOutbox(
   // Rich-путь рендерит нативно то, чего parse_mode=HTML не умеет. Любой отказ —
   // просто HTML-путь ниже, то есть худший случай равен обычному поведению.
   if (transport.sendRich && (alwaysRich || needsRichMessage(text))) {
-    const rich = await transport.sendRich(text);
+    const rich = await transport.sendRich(withButtonTypes(text));
     if (rich.ok) {
       result.delivered = 1;
       return result;
@@ -159,6 +160,14 @@ export async function sendThroughOutbox(
     }
     fail(`plain retry ${plain.error}`);
     if (plain.stop) break;
+  }
+  // Пустой результат — провал самого шва, а не «успех с нулём доставок»: рендер
+  // схлопнулся в пустоту, и вызывающий, забывший проверить delivered, не должен принять
+  // это за отправку. Инвариант живёт здесь, а не тремя копиями у вызывающих: ночной
+  // скрипт по ok=false падает ненулевым кодом, канал не засчитывает латентность.
+  if (result.delivered === 0) {
+    result.ok = false;
+    if (!result.error) result.error = "nothing delivered: empty rendering";
   }
   return result;
 }

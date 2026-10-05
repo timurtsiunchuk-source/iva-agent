@@ -1,3 +1,4 @@
+import { resolveOpenCodeProtocol } from "@iva/opencode-protocol";
 import {
   CATALOG,
   catalogModel,
@@ -14,12 +15,31 @@ import {
   validateModelSelection,
 } from "../lib/model-validation.ts";
 import { getAccessToken } from "#lib/codex-auth.ts";
+import {
+  claudeModelLabel,
+  claudeReasoningLevels,
+  claudeStatus,
+  CLAUDE_LOGIN_HINT,
+  type ClaudeStatus,
+} from "../lib/claude-cli-status.ts";
+import { claudeInstallHint } from "../../packages/claude-command/index.ts";
 import { runDeviceCodeLogin } from "../lib/codex-oauth.ts";
 import { compactNumber, modelSummary } from "../lib/model-summary.ts";
 import { getLang, tr } from "#lib/i18n.ts";
 import { readEnvValues, upsertEnv } from "../lib/env-file.ts";
 import { createFlows } from "../lib/tg-flow.ts";
-import type { ModelOption } from "../lib/model-catalog.ts";
+import {
+  button,
+  buttonRow,
+  escapeRichText,
+  richRow,
+  type RichButton,
+  type RichButtonStyle,
+} from "../lib/telegram-buttons.ts";
+import type {
+  ModelOption,
+  ProviderCatalogEntry,
+} from "../lib/model-catalog.ts";
 import type { TelegramFlowState } from "../lib/tg-flow.ts";
 import { ALLOWED, DATA_DIR_ABS, ENV_PATH, log } from "./config.ts";
 import { reply, sc, tg } from "./transport.ts";
@@ -42,6 +62,8 @@ type WizardState = TelegramFlowState & {
   dropKey?: boolean;
   // Адрес своего эндпоинта, введённый в этом же диалоге (custom).
   pendingBase?: string | null;
+  // План подписки из чужого CLI (вендор claude): экран моделей называет его владельцу.
+  plan?: string | null;
   reenterKey?: string | null;
 };
 type WizardRequestResult<T> =
@@ -110,16 +132,12 @@ const newWizard = (
   flow: string,
   extra: Record<string, unknown> = {},
 ): WizardState => flows.start(chatId, userId, flow, extra) as WizardState;
-const wizScreen = (
-  st: WizardState,
-  text: string,
-  rows?: Array<Array<Record<string, unknown>>>,
-) => flows.screenWithResult(st, text, rows);
-const endWizard = (
-  st: WizardState,
-  text: string,
-  rows?: Array<Array<Record<string, unknown>>>,
-) => flows.endWithResult(st, text, rows);
+// Экран визарда — одна markdown-строка с кнопками прямо в тексте: ряды инлайн-клавиатуры
+// больше не собираются, движок рисует rich-сообщение сам.
+const wizScreen = (st: WizardState, text: string) =>
+  flows.screenWithResult(st, text);
+const endWizard = (st: WizardState, text: string) =>
+  flows.endWithResult(st, text);
 const wizardIsCurrent = (st: WizardState) =>
   flows.get(st.chatId, st.userId) === st;
 
@@ -154,21 +172,28 @@ export function isStaleWizard(
   );
 }
 
+// Verb без аргумента живёт на своих шагах: таблица вместо цепочки if, потому что шагов
+// становится больше, а правило остаётся одним — кнопка работает там, где её нарисовали.
+const PLAIN_STEPS = new Map<string, readonly string[]>([
+  ["keep", ["intro", "effort"]],
+  ["chg", ["intro"]],
+  // «Без ключа» — только там, где ключ на самом деле необязателен.
+  ["nokey", ["awaiting_key"]],
+  ["retry", ["model_error", "cli_status"]],
+  ["back", ["model_error"]],
+]);
+
 export function wizardActionAllowed(
   st: Pick<WizardSnapshot, "step"> | null,
   action: string,
 ) {
-  if (!st || action === "cancel") return Boolean(st);
-  if (action === "keep") return st.step === "intro" || st.step === "effort";
-  if (action === "chg") return st.step === "intro";
-  // «Без ключа» живёт ровно на экране ввода ключа и только у провайдера, где ключ не обязателен.
-  if (action === "nokey") return st.step === "awaiting_key";
+  if (!st) return false;
+  if (action === "cancel") return true;
   if (action.startsWith("prov:")) return st.step === "provider";
   if (action.startsWith("m:")) return st.step === "models";
   if (action.startsWith("eff:")) return st.step === "effort";
-  if (action === "retry" || action === "back") return st.step === "model_error";
   if (action.startsWith("rs:")) return st.step === "saved";
-  return false;
+  return PLAIN_STEPS.get(action)?.includes(st.step ?? "") ?? false;
 }
 
 export function selectWizardModel(
@@ -195,6 +220,24 @@ export function selectWizardEffort(st: WizardSnapshot, value: string): boolean {
   return true;
 }
 
+/** Claude держит порядок Fable → Opus → Sonnet. Остальные каталоги поднимают текущую модель. */
+function wizardModelOptions(
+  provider: string,
+  options: ModelOption[],
+  current: string | undefined,
+): ModelOption[] {
+  if (provider === "claude") return options;
+  return selectableWizardOptions(options, current ?? "");
+}
+
+function modelPrompt(): string {
+  return tr("Choose a model:", "Выбери модель:");
+}
+
+function modelButtonLabel(option: ModelOption): string {
+  return option.label ?? option.id;
+}
+
 export function selectableWizardOptions(
   options: unknown,
   current: string,
@@ -218,6 +261,10 @@ export async function currentConfig({
   return {
     provider,
     providerIsValid: valid,
+    adjustableThinking:
+      providerSupportsReasoning(provider) &&
+      (provider !== "opencode" ||
+        resolveOpenCodeProtocol(env.OPENCODE_PROTOCOL) === "chat-completions"),
     // Что реально стоит в .env. На неизвестном имени агент не стартует вовсе, и назвать
     // его «ollama» в строке «Сейчас…» значило бы спрятать причину, ради которой визард
     // и открыли. Экраны после сохранения показывают уже записанное имя, оно валидно.
@@ -225,16 +272,31 @@ export async function currentConfig({
     // Модель — тем же правилом, что у Статуса и рантайма. У невалидного провайдера модели
     // нет: показать OLLAMA_MODEL значило бы назвать модель, к которой никто не пойдёт.
     model: catalogModel(configured, env) ?? "?",
-    effort: providerSupportsReasoning(provider)
-      ? (env.THINKING_EFFORT ?? "").toLowerCase()
-      : "",
+    effort:
+      providerSupportsReasoning(provider) &&
+      (provider !== "opencode" ||
+        resolveOpenCodeProtocol(env.OPENCODE_PROTOCOL) === "chat-completions")
+        ? (env.THINKING_EFFORT ?? "").toLowerCase()
+        : "",
   };
 }
 
-const btn = (text: string, callback_data: string) => ({ text, callback_data });
+// Кнопка — rich-строка: кнопка стоит в самом тексте сообщения, рядом со своим пояснением.
+// RichButton — переходный тип: пока экраны визарда возвращают старые ряды «text + rows»,
+// строка обязана проходить и в {text, callback_data}. D3 снимает ряды — уйдёт и тип.
+const btn = (
+  text: string,
+  callback_data: string,
+  style?: RichButtonStyle,
+): RichButton => button(text, callback_data, style);
 // cancelRow/menuRow — функции (tr на месте вызова), не module-level const с переведённой строкой.
-const cancelRow = () => [btn(tr("Cancel", "Отмена"), "iva_model:cancel")];
-const retryBackRows = () => [
+// Каждая — абзац «кнопка — что она делает» (контракт rich), обёрнутый в старый ряд richRow.
+const cancelRow = () =>
+  richRow(
+    `${btn(tr("Cancel", "Отмена"), "iva_model:cancel", "danger")} — ${tr("leave without changes", "выйти без изменений")}`,
+  );
+// Два равноправных варианта без пояснений — один ряд кнопок.
+const retryBackRows = (): RichButton[][] => [
   [
     btn(tr("Retry", "Повторить"), "iva_model:retry"),
     btn(tr("‹ Back", "‹ Назад"), "iva_model:back"),
@@ -242,7 +304,52 @@ const retryBackRows = () => [
 ];
 // Ряд «‹ Меню» на терминальных экранах визарда — возврат в /menu. r:o усыновляет
 // это сообщение даже без живого стейта (движок меню само-чинится после рестарта моста).
-const menuRow = () => [[btn(tr("‹ Menu", "‹ Меню"), "iva_menu:r:o")]];
+const menuRow = (): RichButton[][] => [
+  richRow(
+    `${btn(tr("‹ Menu", "‹ Меню"), "iva_menu:r:o")} — ${tr("back to settings", "вернуться в настройки")}`,
+  ),
+];
+
+// Rich-карта: кнопка — inline-элемент текста, поэтому у каждой есть пояснение рядом, а
+// ряды (buttonRow) остаются только равноправным коротким вариантам: уровни, модели, да/нет.
+//
+// Блок :233-245 переводит на rich параллельный исполнитель (D1): после его правки те же
+// помощники вернут готовые markdown-абзацы. До неё они ещё отдают ряды объектов — тогда
+// строку собираем здесь сами, из тех же подписей и callback_data.
+const wizardLine = (value: unknown): string | null =>
+  typeof value === "string" ? value : null;
+// Заголовок терминального экрана: у /think он свой, у /model — свой.
+const wizardHead = (flow: unknown) =>
+  flow === "think"
+    ? tr("🤔 Thinking", "🤔 Размышления")
+    : tr("🧠 Model", "🧠 Модель");
+const cancelLine = () =>
+  wizardLine(cancelRow()) ??
+  `${button(tr("Cancel", "Отмена"), "iva_model:cancel", "danger")} — ${tr(
+    "exit without changes.",
+    "выйти без изменений.",
+  )}`;
+const menuLine = () =>
+  wizardLine(menuRow()) ??
+  `${button(tr("‹ Menu", "‹ Меню"), "iva_menu:r:o")} — ${tr(
+    "back to the settings.",
+    "вернуться в настройки.",
+  )}`;
+const retryBackLines = () => {
+  const ready = wizardLine(retryBackRows());
+  return ready
+    ? [ready]
+    : [
+        `${button(tr("Retry", "Повторить"), "iva_model:retry")} — ${tr(
+          "ask the provider again.",
+          "спросить провайдера ещё раз.",
+        )}`,
+        `${button(tr("‹ Back", "‹ Назад"), "iva_model:back")} — ${tr(
+          "pick another provider.",
+          "выбрать другого провайдера.",
+        )}`,
+      ];
+};
 
 // Секреты (API-ключи) принимаем ТОЛЬКО в личке: в группе бот может не иметь прав удалить
 // сообщение с ключом (deleteMessage вернёт !ok), и его увидят все участники. Знак chatId
@@ -252,38 +359,52 @@ const isPrivateChat = (st: WizardState) => Number(st.chatId) > 0;
 const refuseSecretInGroup = (st: WizardState) =>
   endWizard(
     st,
-    tr(
-      "API keys are secrets — open a private chat with me and set the key there.",
-      "Ключи — это секрет. Открой личный чат со мной и введи ключ там.",
-    ),
-    menuRow(),
+    [
+      `# ${wizardHead(st.flow)}`,
+      tr(
+        "API keys are secrets — open a private chat with me and set the key there.",
+        "Ключи — это секрет. Открой личный чат со мной и введи ключ там.",
+      ),
+      menuLine(),
+    ].join("\n\n"),
   );
 // Ввод текстом мост перехватывает только в личке (scripts/poller/control.ts). В группе
 // визард ждал бы сообщения, которое до него не дойдёт, — поэтому отказ до установки awaitText.
 const refuseInputInGroup = (st: WizardState) =>
   endWizard(
     st,
-    tr(
-      "This one needs a private chat with me — open one and send /model there.",
-      "Это настраивается только в личном чате — открой его и отправь /model там.",
-    ),
-    menuRow(),
+    [
+      `# ${wizardHead(st.flow)}`,
+      tr(
+        "This one needs a private chat with me — open one and send /model there.",
+        "Это настраивается только в личном чате — открой его и отправь /model там.",
+      ),
+      menuLine(),
+    ].join("\n\n"),
   );
 
-function effortRows(ns: string, withKeep: boolean, efforts: string[]) {
-  const rows: Array<Array<Record<string, unknown>>> = [];
+// Уровни размышлений — равноправные короткие варианты без пояснений: ряд кнопок на
+// каждый экран плюс «не задавать» и сохранение/выход — кнопкой в ряду.
+function effortLines(ns: string, withKeep: boolean, efforts: string[]) {
+  const lines: string[] = [];
   for (let i = 0; i < efforts.length; i += 3) {
-    rows.push(
-      efforts
-        .slice(i, i + 3)
-        .map((effort: string) => btn(effort, `${ns}:eff:${effort}`)),
+    lines.push(
+      buttonRow(
+        efforts
+          .slice(i, i + 3)
+          .map((effort: string) => button(effort, `${ns}:eff:${effort}`)),
+      ),
     );
   }
-  rows.push([
-    btn(tr("Don't set", "Не задавать"), `${ns}:eff:unset`),
-    withKeep ? btn(tr("Keep", "Оставить"), `${ns}:keep`) : cancelRow()[0],
-  ]);
-  return rows;
+  lines.push(
+    buttonRow([
+      button(tr("Don't set", "Не задавать"), `${ns}:eff:unset`),
+      withKeep
+        ? button(tr("Keep", "Оставить"), `${ns}:keep`)
+        : button(tr("Cancel", "Отмена"), "iva_model:cancel", "danger"),
+    ]),
+  );
+  return lines;
 }
 
 // {msgId} (опц.) — хендофф из /menu: визард заменяет flow-слот и рисует в ТО ЖЕ сообщение меню.
@@ -296,19 +417,23 @@ async function handleModelCmd(
   const st = newWizard(chatId, from, "model");
   st.msgId = msgId ?? null;
   st.step = "intro";
-  return wizScreen(
-    st,
-    tr(
-      `Now: provider ${providerLabel} · model ${model} · thinking: ${effortLabel(effort)}.`,
-      `Сейчас: провайдер ${providerLabel} · модель ${model} · размышления: ${effortLabel(effort)}.`,
-    ),
+  const text = [
+    `# ${tr("🧠 Model", "🧠 Модель")}`,
     [
-      [
-        btn(tr("Change", "Сменить"), "iva_model:chg"),
-        btn(tr("Keep", "Оставить"), "iva_model:keep"),
-      ],
-    ],
-  );
+      `| ${tr("Provider", "Провайдер")} | ${tr("Model", "Модель")} | ${tr("Thinking", "Размышления")} |`,
+      "| --- | --- | --- |",
+      `| ${escapeRichText(providerLabel)} | ${escapeRichText(model)} | ${escapeRichText(effortLabel(effort))} |`,
+    ].join("\n"),
+    `${button(tr("Change", "Сменить"), "iva_model:chg")} — ${tr(
+      "pick another provider or model.",
+      "выбрать другого провайдера или модель.",
+    )}`,
+    `${button(tr("Keep", "Оставить"), "iva_model:keep")} — ${tr(
+      "change nothing.",
+      "ничего не менять.",
+    )}`,
+  ].join("\n\n");
+  return wizScreen(st, text);
 }
 
 async function handleThinkCmd(
@@ -322,45 +447,44 @@ async function handleThinkCmd(
     readEnv?: () => Promise<Record<string, string>>;
   } = {},
 ) {
-  const { provider, providerIsValid, providerLabel, model, effort } =
-    await currentConfig(readEnv ? { readEnv } : {});
+  const {
+    provider,
+    providerIsValid,
+    providerLabel,
+    model,
+    effort,
+    adjustableThinking,
+  } = await currentConfig(readEnv ? { readEnv } : {});
   const st = newWizard(chatId, from, "think");
   st.provider = provider;
   st.model = model;
   st.msgId = msgId ?? null;
-  // Уровни размышлений выбираются у провайдера, а на неизвестном имени агент не стартует
-  // вовсе: нарисовать кнопки ollama значило бы принять настройку, которая никуда не поедет.
-  // /model — тот же экран, что чинит причину, и метка провайдера там та же.
-  if (!providerIsValid) {
+  const refused = thinkRefusal(
+    provider,
+    providerIsValid,
+    providerLabel,
+    adjustableThinking,
+  );
+  if (refused !== null)
     return endWizard(
       st,
-      tr(
-        `Thinking levels need a working provider — MODEL_PROVIDER is ${providerLabel}. Set it via /model.`,
-        `Уровни размышлений нужны рабочему провайдеру — MODEL_PROVIDER сейчас ${providerLabel}. Задай его через /model.`,
+      [`# ${tr("🤔 Thinking", "🤔 Размышления")}`, refused, menuLine()].join(
+        "\n\n",
       ),
-      menuRow(),
     );
-  }
-  if (!providerSupportsReasoning(provider)) {
-    return endWizard(
-      st,
-      tr(
-        `Adjustable thinking is unavailable for ${CATALOG[provider].label}. Choose a reasoning-capable provider via /model.`,
-        `Настраиваемые размышления недоступны для ${CATALOG[provider].label}. Выбери провайдера с reasoning через /model.`,
-      ),
-      menuRow(),
-    );
-  }
   const cat = CATALOG[provider];
   const env = await readEnvValues(ENV_PATH);
   st.step = "loading";
   const loadingShown = await wizScreen(
     st,
-    tr(
-      `Loading thinking levels for ${model}…`,
-      `Загружаю уровни размышлений для ${model}…`,
-    ),
-    [cancelRow()],
+    [
+      `# ${tr("🤔 Thinking", "🤔 Размышления")}`,
+      tr(
+        `Loading thinking levels for ${escapeRichText(model)}…`,
+        `Загружаю уровни размышлений для ${escapeRichText(model)}…`,
+      ),
+      cancelLine(),
+    ].join("\n\n"),
   );
   if (!wizardIsCurrent(st)) return loadingShown;
   const loaded = await runWizardRequest(st, () =>
@@ -370,7 +494,7 @@ async function handleThinkCmd(
   );
   const options = await resolveThinkCatalogLoad(st, loaded);
   if (options === null) return loadingShown;
-  const option = options.find((candidate) => candidate.id === model);
+  const option = thinkOption(provider, options, model);
   if (!option)
     return showModelValidationError(
       st,
@@ -385,12 +509,54 @@ async function handleThinkCmd(
   st.step = "effort";
   return wizScreen(
     st,
-    tr(
-      `Thinking level for ${model}: ${effortLabel(effort)}.`,
-      `Уровень размышлений для ${model}: ${effortLabel(effort)}.`,
-    ),
-    effortRows("iva_think", true, st.efforts),
+    [
+      `# ${tr("🤔 Thinking", "🤔 Размышления")}`,
+      tr(
+        `Thinking level for ${escapeRichText(model)}: ${escapeRichText(effortLabel(effort))}.`,
+        `Уровень размышлений для ${escapeRichText(model)}: ${escapeRichText(effortLabel(effort))}.`,
+      ),
+      ...effortLines("iva_think", true, st.efforts),
+    ].join("\n\n"),
   );
+}
+
+/** Почему /think не рисует уровни ещё до каталога; null — провайдер годится.
+ *  Уровни размышлений выбираются у провайдера, а на неизвестном имени агент не стартует
+ *  вовсе: нарисовать кнопки ollama значило бы принять настройку, которая никуда не поедет.
+ *  /model — тот же экран, что чинит причину, и метка провайдера там та же. */
+function thinkRefusal(
+  provider: string,
+  providerIsValid: boolean,
+  providerLabel: string,
+  adjustableThinking = providerSupportsReasoning(provider),
+): string | null {
+  if (!providerIsValid)
+    return tr(
+      `Thinking levels need a working provider — MODEL_PROVIDER is ${escapeRichText(providerLabel)}. Set it via /model.`,
+      `Уровни размышлений нужны рабочему провайдеру — MODEL_PROVIDER сейчас ${escapeRichText(providerLabel)}. Задай его через /model.`,
+    );
+  if (!adjustableThinking)
+    return tr(
+      `Adjustable thinking is unavailable for ${escapeRichText(CATALOG[provider].label)}. Choose a reasoning-capable provider via /model.`,
+      `Настраиваемые размышления недоступны для ${escapeRichText(CATALOG[provider].label)}. Выбери провайдера с reasoning через /model.`,
+    );
+  return null;
+}
+
+/** Модель /think в живом списке. Прошлую модель Claude (Sonnet 5, Opus 5) новый CLI в кнопки
+ *  не отдаёт — её место заняла новая, — но ход на ней идёт, и уровни у неё те же: их знает
+ *  таблица экрана Claude. Незнакомый id остаётся ошибкой каталога. */
+function thinkOption(
+  provider: string,
+  options: readonly ModelOption[],
+  model: string,
+): ModelOption | undefined {
+  const listed = options.find((candidate) => candidate.id === model);
+  if (listed || provider !== "claude") return listed;
+  const reasoningLevels = claudeReasoningLevels(model);
+  return reasoningLevels.length > 0
+    ? { id: model, label: claudeModelLabel(model), reasoningLevels }
+    : undefined;
 }
 
 export async function resolveThinkCatalogLoad(
@@ -408,11 +574,31 @@ export async function resolveThinkCatalogLoad(
 
 async function showProviderScreen(st: WizardState) {
   st.step = "provider";
-  const rows = Object.entries(CATALOG).map(([id, c]) => [
-    btn(c.label, `iva_model:prov:${id}`),
-  ]);
-  rows.push(cancelRow());
-  return wizScreen(st, tr("Pick a provider:", "Выбери провайдера:"), rows);
+  const authNote = (auth: string) => {
+    if (auth === "oauth")
+      return tr(
+        "sign in with the OpenAI subscription.",
+        "вход по подписке OpenAI.",
+      );
+    if (auth === "cli")
+      return tr(
+        "uses the claude CLI signed in on this server — no key.",
+        "работает через CLI claude, залогиненный на этом сервере, — ключа нет.",
+      );
+    return auth === "key-optional"
+      ? tr("the key is optional here.", "ключ тут не обязателен.")
+      : tr("connect with an API key.", "подключение по API-ключу.");
+  };
+  const lines = [
+    `# ${tr("🧠 Model", "🧠 Модель")}`,
+    tr("Pick a provider:", "Выбери провайдера:"),
+    ...Object.entries(CATALOG).map(
+      ([id, c]) =>
+        `${button(c.label, `iva_model:prov:${id}`)} — ${authNote(c.auth)}`,
+    ),
+    cancelLine(),
+  ];
+  return wizScreen(st, lines.join("\n\n"));
 }
 
 // Экран ввода адреса своего эндпоинта (custom). Не секрет, но приходит тем же текстовым
@@ -421,18 +607,22 @@ function askBaseUrl(st: WizardState, current?: string) {
   if (!isPrivateChat(st)) return refuseInputInGroup(st);
   st.awaitText = { kind: "baseurl", secret: false, data: {} };
   st.step = "awaiting_base";
-  const known = current
-    ? tr(`Now: ${current}.\n`, `Сейчас: ${current}.\n`)
-    : "";
-  return wizScreen(
-    st,
-    known +
+  const lines = [`# ${tr("🧠 Model", "🧠 Модель")}`];
+  if (current)
+    lines.push(
       tr(
-        "Send the OpenAI-compatible endpoint of your provider — the full base, including the /v1-style suffix (e.g. https://api.example.com/v1).",
-        "Пришли OpenAI-совместимый адрес своего провайдера — базу целиком, вместе с суффиксом вида /v1 (напр. https://api.example.com/v1).",
+        `Now: ${escapeRichText(current)}.`,
+        `Сейчас: ${escapeRichText(current)}.`,
       ),
-    [cancelRow()],
+    );
+  lines.push(
+    tr(
+      "Send the OpenAI-compatible endpoint of your provider — the full base, including the /v1-style suffix (e.g. https://api.example.com/v1).",
+      "Пришли OpenAI-совместимый адрес своего провайдера — базу целиком, вместе с суффиксом вида /v1 (напр. https://api.example.com/v1).",
+    ),
+    cancelLine(),
   );
+  return wizScreen(st, lines.join("\n\n"));
 }
 
 // Экран ввода имени модели: у чужого эндпоинта каталога моделей может не быть вовсе,
@@ -441,21 +631,22 @@ function askModelId(st: WizardState, reason?: string) {
   if (!isPrivateChat(st)) return refuseInputInGroup(st);
   st.awaitText = { kind: "modelid", secret: false, data: {} };
   st.step = "awaiting_model";
-  const why = reason
-    ? tr(
-        `The endpoint has no model list I can read (${reason}).\n`,
-        `Список моделей у эндпоинта прочитать не вышло (${reason}).\n`,
-      )
-    : "";
-  return wizScreen(
-    st,
-    why +
+  const lines = [`# ${tr("🧠 Model", "🧠 Модель")}`];
+  if (reason)
+    lines.push(
       tr(
-        "Send the model id exactly as your provider names it.",
-        "Пришли id модели ровно так, как называет её провайдер.",
+        `The endpoint has no model list I can read (${reason}).`,
+        `Список моделей у эндпоинта прочитать не вышло (${reason}).`,
       ),
-    [cancelRow()],
+    );
+  lines.push(
+    tr(
+      "Send the model id exactly as your provider names it.",
+      "Пришли id модели ровно так, как называет её провайдер.",
+    ),
+    cancelLine(),
   );
+  return wizScreen(st, lines.join("\n\n"));
 }
 
 async function pickProvider(st: WizardState, provider: string) {
@@ -463,13 +654,18 @@ async function pickProvider(st: WizardState, provider: string) {
   st.pendingKey = null;
   st.pendingBase = null;
   st.dropKey = false;
+  st.plan = null;
   const cat = CATALOG[provider];
+  if (cat.auth === "cli") return await pickCliProvider(st, cat);
   if (cat.auth === "oauth") {
     st.step = "loading";
     const loadingShown = await wizScreen(
       st,
-      tr("Checking the OpenAI subscription…", "Проверяю подписку OpenAI…"),
-      [cancelRow()],
+      [
+        `# ${tr("🧠 Model", "🧠 Модель")}`,
+        tr("Checking the OpenAI subscription…", "Проверяю подписку OpenAI…"),
+        cancelLine(),
+      ].join("\n\n"),
     );
     if (!wizardIsCurrent(st)) return loadingShown;
     // File presence is not enough — a revoked/expired refresh token would let the wizard
@@ -489,6 +685,66 @@ async function pickProvider(st: WizardState, provider: string) {
   }
   return askKeyOrShowModels(st, env);
 }
+
+/**
+ * Вендор без ключа: единственный источник входа — CLI на том же сервере. Ни поставить
+ * пакет, ни войти в подписку из Telegram нельзя, поэтому мастер показывает две команды
+ * для сервера и кнопку «Проверить снова», а не спрашивает ключ, которого не существует.
+ */
+async function pickCliProvider(st: WizardState, cat: ProviderCatalogEntry) {
+  st.step = "loading";
+  const env = await readEnvValues(ENV_PATH);
+  if (!wizardIsCurrent(st)) return false;
+  const loadingShown = await wizScreen(
+    st,
+    [
+      `# ${tr("🧠 Model", "🧠 Модель")} · ${escapeRichText(cat.label)}`,
+      tr("Checking the claude CLI…", "Проверяю CLI claude…"),
+      cancelLine(),
+    ].join("\n\n"),
+  );
+  if (!wizardIsCurrent(st)) return loadingShown;
+  // PATH берём у процесса, остальное — из свежего .env: CLAUDE_COMMAND могли вписать
+  // только что, а сервис читает файл при старте.
+  const checked = await runWizardRequest(st, () =>
+    claudeStatus({ ...process.env, ...env }),
+  );
+  if (checked.stale) return loadingShown;
+  if (!checked.ok || !checked.value.ready)
+    return showCliStatusScreen(st, checked.ok ? checked.value : noClaude());
+  st.plan = checked.value.plan;
+  return showModelScreen(st);
+}
+
+/** Экран «CLI ещё не готов»: причина с командой для сервера и кнопка перечитать статус. */
+async function showCliStatusScreen(st: WizardState, status: ClaudeStatus) {
+  st.step = "cli_status";
+  return wizScreen(
+    st,
+    [
+      `# ${tr("🧠 Model", "🧠 Модель")} · ${escapeRichText(CATALOG[st.provider].label)}`,
+      tr(
+        `Iva calls the claude CLI on this server, and it isn't ready: ${escapeRichText(status.hint)}`,
+        `Ива зовёт CLI claude на этом же сервере, а он ещё не готов: ${escapeRichText(status.hint)}`,
+      ),
+      `${button(tr("Check again", "Проверить снова"), "iva_model:retry")} — ${tr(
+        "read the status again.",
+        "перечитать статус.",
+      )}`,
+      cancelLine(),
+    ].join("\n\n"),
+  );
+}
+
+/** Отказ проверки статуса: сказать владельцу то же, что сказал бы доктор. */
+const noClaude = (): ClaudeStatus => ({
+  installed: false,
+  loggedIn: false,
+  plan: "",
+  conflict: null,
+  ready: false,
+  hint: `${claudeInstallHint()} и ${CLAUDE_LOGIN_HINT}`,
+});
 
 // Продолжение после введённого адреса: тот же порядок шагов, что и в pickProvider.
 async function pickProviderAfterBase(st: WizardState) {
@@ -512,18 +768,24 @@ async function askKeyOrShowModels(
     st.step = "awaiting_key";
     // Свой эндпоинт может стоять без авторизации — тогда ключа нет и спрашивать нечего.
     const optional = cat.auth === "key-optional";
-    return wizScreen(
-      st,
+    const lines = [
+      `# ${tr("🧠 Model", "🧠 Модель")}`,
       tr(
         `Need a ${cat.label} API key. Send it in the next message — I'll delete it from the chat right away.\n` +
           "If I don't confirm within a couple of seconds — don't resend, start over with /model.",
         `Нужен API-ключ ${cat.label}. Пришли его следующим сообщением — я сразу удалю его из чата.\n` +
           "Если через пару секунд не подтвержу получение — не отправляй повторно, начни заново с /model.",
       ),
-      optional
-        ? [[btn(tr("No key", "Без ключа"), "iva_model:nokey")], cancelRow()]
-        : [cancelRow()],
-    );
+    ];
+    if (optional)
+      lines.push(
+        `${button(tr("No key", "Без ключа"), "iva_model:nokey")} — ${tr(
+          "if the provider is local.",
+          "если провайдер локальный.",
+        )}`,
+      );
+    lines.push(cancelLine());
+    return wizScreen(st, lines.join("\n\n"));
   }
   return showModelScreen(st);
 }
@@ -535,8 +797,14 @@ async function showModelScreen(st: WizardState) {
   st.step = "loading";
   const loadingShown = await wizScreen(
     st,
-    tr(`Loading models for ${cat.label}…`, `Загружаю модели ${cat.label}…`),
-    [cancelRow()],
+    [
+      `# ${tr("🧠 Model", "🧠 Модель")}`,
+      tr(
+        `Loading models for ${escapeRichText(cat.label)}…`,
+        `Загружаю модели ${escapeRichText(cat.label)}…`,
+      ),
+      cancelLine(),
+    ].join("\n\n"),
   );
   if (!wizardIsCurrent(st)) return loadingShown;
   const base = cat.baseVar
@@ -557,33 +825,60 @@ async function showModelScreen(st: WizardState) {
       return askModelId(st, errorReason(loaded.error));
     return showModelValidationError(st, loaded.error);
   }
-  const options = loaded.value;
+  const responses =
+    st.provider === "opencode" &&
+    resolveOpenCodeProtocol(env.OPENCODE_PROTOCOL) === "responses";
+  const options = responses
+    ? loaded.value.map((option) => ({ ...option, reasoningLevels: [] }))
+    : loaded.value;
   const current = env[cat.modelVar];
-  st.modelOptions = selectableWizardOptions(options, current);
+  st.modelOptions = wizardModelOptions(st.provider, options, current);
   st.step = "models";
-  const rows = st.modelOptions.map((option, i) => [
-    btn(option.id, `iva_model:m:${i}`),
-  ]);
-  rows.push(cancelRow());
-  const currentLine = current
-    ? tr(
-        `Current (display only): ${current}.`,
-        `Текущая (только для справки): ${current}.`,
-      )
-    : "";
-  return wizScreen(
-    st,
-    [
-      currentLine,
-      tr(
-        `Choose a live model (${cat.label}):`,
-        `Выбери модель из живого каталога (${cat.label}):`,
-      ),
-    ]
-      .filter(Boolean)
-      .join("\n"),
-    rows,
+  const lines = [
+    `# ${tr("🧠 Model", "🧠 Модель")} · ${escapeRichText(cat.label)}`,
+    ...modelScreenNotes(st, current),
+    ...(st.provider === "opencode"
+      ? [
+          tr(
+            `Protocol: ${resolveOpenCodeProtocol(env.OPENCODE_PROTOCOL)}. Change it with iva config; Go /messages is unsupported.`,
+            `Протокол: ${resolveOpenCodeProtocol(env.OPENCODE_PROTOCOL)}. Меняется через iva config; Go /messages не поддерживается.`,
+          ),
+        ]
+      : []),
+  ];
+  lines.push(modelPrompt());
+  // Модели — равноправные варианты без пояснений, но id бывают длинными: по одной в строке.
+  lines.push(
+    ...st.modelOptions.map((option, i) =>
+      button(modelButtonLabel(option), `iva_model:m:${i}`),
+    ),
   );
+  lines.push(cancelLine());
+  return wizScreen(st, lines.join("\n\n"));
+}
+
+/** Строки над списком моделей: план подписки из чужого CLI и текущая модель (для справки). */
+function modelScreenNotes(
+  st: WizardState,
+  current: string | undefined,
+): string[] {
+  const notes: string[] = [];
+  // План называет тот же `claude auth status`, что читает доктор.
+  if (st.plan)
+    notes.push(
+      tr(
+        `Plan: ${escapeRichText(st.plan)}.`,
+        `План: ${escapeRichText(st.plan)}.`,
+      ),
+    );
+  if (current)
+    notes.push(
+      tr(
+        `Current (display only): **${escapeRichText(current)}**.`,
+        `Текущая (только для справки): **${escapeRichText(current)}**.`,
+      ),
+    );
+  return notes;
 }
 
 async function showModelValidationError(st: WizardState, error: unknown) {
@@ -597,11 +892,14 @@ async function showModelValidationError(st: WizardState, error: unknown) {
       : tr("provider validation failed", "проверка провайдера не прошла");
   return wizScreen(
     st,
-    tr(
-      `Couldn't validate the live model catalog: ${reason}. Your current configuration was not changed.`,
-      `Не удалось проверить живой каталог моделей: ${reason}. Текущая конфигурация не изменена.`,
-    ),
-    retryBackRows(),
+    [
+      `# ${tr("🧠 Model", "🧠 Модель")}`,
+      tr(
+        `Couldn't validate the live model catalog: ${reason}. Your current configuration was not changed.`,
+        `Не удалось проверить живой каталог моделей: ${reason}. Текущая конфигурация не изменена.`,
+      ),
+      ...retryBackLines(),
+    ].join("\n\n"),
   );
 }
 
@@ -626,24 +924,30 @@ function startCodexLogin(st: WizardState) {
       if (flows.get(st.chatId, st.userId) !== st) return;
       return endWizard(
         st,
-        tr(
-          "Login failed: " +
-            String(errorMessage(e)) +
-            "\nSend /model to try again.",
-          "Вход не удался: " +
-            String(errorMessage(e)) +
-            "\nОтправь /model, чтобы попробовать снова.",
-        ),
-        menuRow(),
+        [
+          `# ${wizardHead(st.flow)}`,
+          tr(
+            "Login failed: " +
+              String(errorMessage(e)) +
+              "\nSend /model to try again.",
+            "Вход не удался: " +
+              String(errorMessage(e)) +
+              "\nОтправь /model, чтобы попробовать снова.",
+          ),
+          menuLine(),
+        ].join("\n\n"),
       );
     });
   return wizScreen(
     st,
-    tr(
-      "Waiting for the OpenAI subscription login — link and code below. The code lives 15 minutes.",
-      "Жду вход по подписке OpenAI — ссылка и код ниже. Код живёт 15 минут.",
-    ),
-    [cancelRow()],
+    [
+      `# ${tr("🧠 Model", "🧠 Модель")}`,
+      tr(
+        "Waiting for the OpenAI subscription login — link and code below. The code lives 15 minutes.",
+        "Жду вход по подписке OpenAI — ссылка и код ниже. Код живёт 15 минут.",
+      ),
+      cancelLine(),
+    ].join("\n\n"),
   );
 }
 
@@ -682,13 +986,16 @@ async function handleWizardText(
   if (!/^\S{8,}$/.test(key)) {
     await endWizard(
       st,
-      tr(
-        "That doesn't look like an API key — the wait is cleared, I deleted the message just in case.\n" +
-          "If it was a question — send it again; come back for a key via /model.",
-        "Это не похоже на API-ключ — ожидание снято, сообщение удалил на всякий случай.\n" +
-          "Если это был вопрос — отправь его ещё раз; за ключом приходи через /model.",
-      ),
-      menuRow(),
+      [
+        `# ${wizardHead(st.flow)}`,
+        tr(
+          "That doesn't look like an API key — the wait is cleared, I deleted the message just in case.\n" +
+            "If it was a question — send it again; come back for a key via /model.",
+          "Это не похоже на API-ключ — ожидание снято, сообщение удалил на всякий случай.\n" +
+            "Если это был вопрос — отправь его ещё раз; за ключом приходи через /model.",
+        ),
+        menuLine(),
+      ].join("\n\n"),
     );
     return true;
   }
@@ -699,11 +1006,14 @@ async function handleWizardText(
   if (!checked.ok) {
     await endWizard(
       st,
-      tr(
-        "Couldn't validate the key. Start again with /model.",
-        "Не удалось проверить ключ. Начни заново через /model.",
-      ),
-      menuRow(),
+      [
+        `# ${wizardHead(st.flow)}`,
+        tr(
+          "Couldn't validate the key. Start again with /model.",
+          "Не удалось проверить ключ. Начни заново через /model.",
+        ),
+        menuLine(),
+      ].join("\n\n"),
     );
     return true;
   }
@@ -711,11 +1021,14 @@ async function handleWizardText(
   if (err) {
     await wizScreen(
       st,
-      tr(
-        `Key rejected (${err}). Send another key or tap «Cancel».`,
-        `Ключ не принят (${err}). Пришли другой ключ или нажми «Отмена».`,
-      ),
-      [cancelRow()],
+      [
+        `# ${wizardHead(st.flow)}`,
+        tr(
+          `Key rejected (${err}). Send another key or tap «Cancel».`,
+          `Ключ не принят (${err}). Пришли другой ключ или нажми «Отмена».`,
+        ),
+        cancelLine(),
+      ].join("\n\n"),
     );
     return true;
   }
@@ -737,11 +1050,14 @@ async function handleBaseUrlText(
   if (!base) {
     await wizScreen(
       st,
-      tr(
-        "That isn't an endpoint address. It needs the scheme and the /v1-style suffix — e.g. https://api.example.com/v1. Send it again or tap «Cancel».",
-        "Это не адрес эндпоинта. Нужна схема и суффикс вида /v1 — напр. https://api.example.com/v1. Пришли ещё раз или нажми «Отмена».",
-      ),
-      [cancelRow()],
+      [
+        `# ${wizardHead(st.flow)}`,
+        tr(
+          "That isn't an endpoint address. It needs the scheme and the /v1-style suffix — e.g. https://api.example.com/v1. Send it again or tap «Cancel».",
+          "Это не адрес эндпоинта. Нужна схема и суффикс вида /v1 — напр. https://api.example.com/v1. Пришли ещё раз или нажми «Отмена».",
+        ),
+        cancelLine(),
+      ].join("\n\n"),
     );
     return true;
   }
@@ -764,11 +1080,14 @@ async function handleModelIdText(
   if (!model || /[\r\n]/.test(model)) {
     await wizScreen(
       st,
-      tr(
-        "That isn't a model id — send one line, exactly as your provider names it.",
-        "Это не id модели — пришли одной строкой, ровно как называет её провайдер.",
-      ),
-      [cancelRow()],
+      [
+        `# ${wizardHead(st.flow)}`,
+        tr(
+          "That isn't a model id — send one line, exactly as your provider names it.",
+          "Это не id модели — пришли одной строкой, ровно как называет её провайдер.",
+        ),
+        cancelLine(),
+      ].join("\n\n"),
     );
     return true;
   }
@@ -788,11 +1107,14 @@ async function handleModelIdText(
     }
     await endWizard(
       st,
-      tr(
-        "Couldn't save .env: " + String(errorMessage(e)),
-        "Не удалось сохранить .env: " + String(errorMessage(e)),
-      ),
-      menuRow(),
+      [
+        `# ${wizardHead(st.flow)}`,
+        tr(
+          "Couldn't save .env: " + String(errorMessage(e)),
+          "Не удалось сохранить .env: " + String(errorMessage(e)),
+        ),
+        menuLine(),
+      ].join("\n\n"),
     );
     return true;
   }
@@ -828,6 +1150,9 @@ export async function validateAndSaveWizard(
     : undefined;
   await validate({
     provider: st.provider,
+    ...(st.provider === "opencode"
+      ? { opencodeProtocol: env.OPENCODE_PROTOCOL }
+      : {}),
     model: st.model,
     key,
     dataDir: DATA_DIR_ABS,
@@ -850,21 +1175,281 @@ const saveWizard = (st: WizardState) => validateAndSaveWizard(st);
 async function showSaved(st: WizardState) {
   const { provider, model, effort } = await currentConfig();
   if (!wizardIsCurrent(st)) return;
-  let text = tr(
-    `Saved: ${provider} · ${model} · thinking: ${effortLabel(effort)}.`,
-    `Сохранил: ${provider} · ${model} · размышления: ${effortLabel(effort)}.`,
-  );
-  text += tr(
-    "\nRestart the agent to apply?",
-    "\nПерезапустить агента, чтобы применить?",
-  );
   st.step = "saved";
-  await wizScreen(st, text, [
+  await wizScreen(
+    st,
     [
-      btn(tr("Restart now", "Перезапустить сейчас"), "iva_model:rs:now"),
-      btn(tr("Later", "Позже"), "iva_model:rs:later"),
-    ],
-  ]);
+      `# ${tr("🧠 Model", "🧠 Модель")}`,
+      tr(
+        `Saved: ${escapeRichText(provider)} · ${escapeRichText(model)} · thinking: ${escapeRichText(effortLabel(effort))}.`,
+        `Сохранил: ${escapeRichText(provider)} · ${escapeRichText(model)} · размышления: ${escapeRichText(effortLabel(effort))}.`,
+      ),
+      tr(
+        "Restart the agent to apply?",
+        "Перезапустить агента, чтобы применить?",
+      ),
+      buttonRow([
+        button(tr("Restart now", "Перезапустить сейчас"), "iva_model:rs:now"),
+        button(tr("Later", "Позже"), "iva_model:rs:later"),
+      ]),
+    ].join("\n\n"),
+  );
+}
+
+type WizardVerbHandler = (st: WizardState, action: string) => Promise<boolean>;
+
+function onWizardKeep(st: WizardState): Promise<boolean> {
+  return endWizard(
+    st,
+    [
+      `# ${wizardHead(st.flow)}`,
+      st.flow === "think"
+        ? tr(
+            "Kept the current thinking level.",
+            "Оставил текущий уровень размышлений.",
+          )
+        : tr(
+            "Kept the current configuration.",
+            "Оставил текущую конфигурацию.",
+          ),
+      menuLine(),
+    ].join("\n\n"),
+  );
+}
+
+function onWizardCancel(st: WizardState): Promise<boolean> {
+  return endWizard(
+    st,
+    [
+      `# ${wizardHead(st.flow)}`,
+      tr("Cancelled.", "Отменено."),
+      menuLine(),
+    ].join("\n\n"),
+  );
+}
+
+function onWizardChg(st: WizardState): Promise<boolean> {
+  return showProviderScreen(st);
+}
+
+async function onWizardNokey(st: WizardState): Promise<boolean> {
+  if (CATALOG[st.provider]?.auth !== "key-optional") return false;
+  st.awaitText = null;
+  st.pendingKey = null;
+  st.dropKey = true;
+  return showModelScreen(st);
+}
+
+async function onWizardProv(st: WizardState, action: string): Promise<boolean> {
+  const p = action.slice("prov:".length);
+  return CATALOG[p] ? pickProvider(st, p) : false;
+}
+
+async function onWizardRetry(st: WizardState): Promise<boolean> {
+  if (st.flow === "think") {
+    return handleThinkCmd(st.chatId, st.userId, {
+      msgId: st.msgId ?? undefined,
+    });
+  }
+  // «Проверить снова» на экране чужого CLI начинает шаг вендора заново, а не просит
+  // каталог у провайдера, вход в которого ещё не сделан.
+  if (st.step === "cli_status") return pickProvider(st, st.provider);
+  return showModelScreen(st);
+}
+
+function onWizardBack(st: WizardState): Promise<boolean> {
+  if (st.flow === "think") {
+    return endWizard(
+      st,
+      [
+        `# ${wizardHead(st.flow)}`,
+        tr("Kept the current configuration.", "Оставил текущую конфигурацию."),
+        menuLine(),
+      ].join("\n\n"),
+    );
+  }
+  return showProviderScreen(st);
+}
+
+async function onWizardModel(
+  st: WizardState,
+  action: string,
+): Promise<boolean> {
+  const option = selectWizardModel(st, action.slice("m:".length));
+  if (!option) return false;
+  if (option.reasoningLevels.length === 0) {
+    st.effort = null;
+    try {
+      await saveWizard(st);
+    } catch (e) {
+      if (!wizardIsCurrent(st)) return false;
+      if (e instanceof ModelValidationError) {
+        return showModelValidationError(st, e);
+      }
+      return endWizard(
+        st,
+        [
+          `# ${wizardHead(st.flow)}`,
+          tr(
+            "Couldn't save .env: " + String(errorMessage(e)),
+            "Не удалось сохранить .env: " + String(errorMessage(e)),
+          ),
+          menuLine(),
+        ].join("\n\n"),
+      );
+    }
+    // The validated configuration is durably written before any UI rendering.
+    if (!wizardIsCurrent(st)) return true;
+    await showSaved(st);
+    return true;
+  }
+  st.step = "effort";
+  return wizScreen(
+    st,
+    [
+      `# ${tr("🧠 Model", "🧠 Модель")}`,
+      tr(
+        `Thinking level for ${escapeRichText(option.id)}:`,
+        `Уровень размышлений для ${escapeRichText(option.id)}:`,
+      ),
+      ...effortLines("iva_model", false, st.efforts),
+    ].join("\n\n"),
+  );
+}
+
+async function onWizardEffort(
+  st: WizardState,
+  action: string,
+): Promise<boolean> {
+  const v = action.slice("eff:".length);
+  if (!selectWizardEffort(st, v)) return false;
+  try {
+    await saveWizard(st);
+  } catch (e) {
+    if (!wizardIsCurrent(st)) return false;
+    if (e instanceof ModelValidationError) {
+      return showModelValidationError(st, e);
+    }
+    return endWizard(
+      st,
+      [
+        `# ${wizardHead(st.flow)}`,
+        tr(
+          "Couldn't save .env: " + String(errorMessage(e)),
+          "Не удалось сохранить .env: " + String(errorMessage(e)),
+        ),
+        menuLine(),
+      ].join("\n\n"),
+    );
+  }
+  // The validated configuration is durably written before any UI rendering.
+  if (!wizardIsCurrent(st)) return true;
+  await showSaved(st);
+  return true;
+}
+
+function onWizardRestartLater(st: WizardState): Promise<boolean> {
+  return endWizard(
+    st,
+    [
+      `# ${wizardHead(st.flow)}`,
+      tr(
+        "Saved. It'll apply after a restart (/restart).",
+        "Сохранил. Применится после перезапуска (/restart).",
+      ),
+      menuLine(),
+    ].join("\n\n"),
+  );
+}
+
+async function onWizardRestartNow(st: WizardState): Promise<boolean> {
+  await endWizard(
+    st,
+    [
+      `# ${wizardHead(st.flow)}`,
+      tr(
+        "Restarting the agent… (~30s). The current conversation resumes after the restart.",
+        "Перезапускаю агента… (~30 сек). Текущий диалог продолжится после перезапуска.",
+      ),
+      menuLine(),
+    ].join("\n\n"),
+  );
+  // Plain restart: a config change is not a recovery — parked
+  // conversations in .workflow-data survive and resume under the new model.
+  const ok = await sc("restart", "iva.service");
+  if (ok) {
+    const { provider, model, effort } = await currentConfig();
+    await reply(
+      st.chatId,
+      tr(
+        `Done — the new configuration is active: ${provider} · ${model} · thinking: ${effortLabel(effort)}.`,
+        `Готово — новая конфигурация активна: ${provider} · ${model} · размышления: ${effortLabel(effort)}.`,
+      ),
+    );
+    return true;
+  } else {
+    const failed = await reply(
+      st.chatId,
+      tr(
+        "Couldn't restart (systemctl). Check the service on the server.",
+        "Не удалось перезапустить (systemctl). Проверь сервис на сервере.",
+      ),
+    );
+    return replySucceeded(failed);
+  }
+}
+
+// Таблица глагол → обработчик. Точные совпадения — по ключу, префиксные глаголы
+// (prov:/m:/eff:) — по началу действия.
+const WIZARD_VERB_HANDLERS: Record<string, WizardVerbHandler> = {
+  keep: onWizardKeep,
+  cancel: onWizardCancel,
+  chg: onWizardChg,
+  nokey: onWizardNokey,
+  retry: onWizardRetry,
+  back: onWizardBack,
+  "rs:later": onWizardRestartLater,
+  "rs:now": onWizardRestartNow,
+};
+
+function wizardHandlerFor(action: string): WizardVerbHandler | null {
+  const exact = WIZARD_VERB_HANDLERS[action];
+  if (exact) return exact;
+  if (action.startsWith("prov:")) return onWizardProv;
+  if (action.startsWith("m:")) return onWizardModel;
+  if (action.startsWith("eff:")) return onWizardEffort;
+  return null;
+}
+
+// Досмотр отправителя: доверенный — наружу именем, чужой тап уже проглочен
+// со своим вердиктом. Проверки дословно из диспетчера: порядок и вердикты те же.
+function wizardSender(cq: {
+  from?: { id?: string | number };
+}): { verdict: boolean } | { from: string } {
+  const senderId = cq.from?.id;
+  const from = senderId === undefined ? null : String(senderId);
+  if (from === null) return { verdict: false };
+  if (ALLOWED.size === 0 || !ALLOWED.has(from)) return { verdict: true }; // swallow untrusted taps
+  return { from };
+}
+
+// Протухший или потерянный визард: отвечаем «устарело» здесь, дальше не идём.
+// Живое состояние возвращается наружу — диспетчеру не нужен отдельный null-чек.
+async function answeredStaleWizard(
+  st: WizardState | null,
+  chatId: number | undefined,
+  messageId: number | undefined,
+): Promise<{ answered: boolean } | { live: WizardState }> {
+  if (st !== null && !isStaleWizard(st, messageId)) return { live: st };
+  const expired = await tg("editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: tr(
+      "This dialog has expired — send /model again.",
+      "Диалог устарел — отправь /model заново.",
+    ),
+  });
+  return { answered: messageCallSucceeded(expired) };
 }
 
 // Inline-button taps for /model and /think. Mirrors handleUpdateCallback: ack the
@@ -875,182 +1460,22 @@ async function handleWizardCallback(cq: {
   from?: { id?: string | number };
   message?: { chat?: { id?: number }; message_id?: number };
 }) {
-  const senderId = cq.from?.id;
-  const from = senderId === undefined ? null : String(senderId);
   const chatId = cq.message?.chat?.id;
   const messageId = cq.message?.message_id;
   await tg("answerCallbackQuery", { callback_query_id: cq.id }); // spinner only; never primary proof
-  if (from === null) return false;
-  if (ALLOWED.size === 0 || !ALLOWED.has(from)) return true; // swallow untrusted taps
+  const sender = wizardSender(cq);
+  if (!("from" in sender)) return sender.verdict;
+  const from = sender.from;
   const action = cq.data.replace(/^iva_(model|think):/, "");
   const st = getWizard(chatId, from);
   // No state (bridge restarted / TTL) or a tap on an older wizard message → stale.
-  if (isStaleWizard(st, messageId) || st === null) {
-    const expired = await tg("editMessageText", {
-      chat_id: chatId,
-      message_id: messageId,
-      text: tr(
-        "This dialog has expired — send /model again.",
-        "Диалог устарел — отправь /model заново.",
-      ),
-    });
-    return messageCallSucceeded(expired);
-  }
-  if (!wizardActionAllowed(st, action)) return false;
-  if (action === "keep") {
-    return endWizard(
-      st,
-      st.flow === "think"
-        ? tr(
-            "Kept the current thinking level.",
-            "Оставил текущий уровень размышлений.",
-          )
-        : tr(
-            "Kept the current configuration.",
-            "Оставил текущую конфигурацию.",
-          ),
-      menuRow(),
-    );
-  }
-  if (action === "cancel") {
-    return endWizard(st, tr("Cancelled.", "Отменено."), menuRow());
-  }
-  if (action === "chg") {
-    return showProviderScreen(st);
-  }
-  if (action === "nokey") {
-    if (CATALOG[st.provider]?.auth !== "key-optional") return false;
-    st.awaitText = null;
-    st.pendingKey = null;
-    st.dropKey = true;
-    return showModelScreen(st);
-  }
-  if (action.startsWith("prov:")) {
-    const p = action.slice("prov:".length);
-    return CATALOG[p] ? pickProvider(st, p) : false;
-  }
-  if (action === "retry") {
-    if (st.flow === "think") {
-      return handleThinkCmd(st.chatId, st.userId, {
-        msgId: st.msgId ?? undefined,
-      });
-    }
-    return showModelScreen(st);
-  }
-  if (action === "back") {
-    if (st.flow === "think") {
-      return endWizard(
-        st,
-        tr("Kept the current configuration.", "Оставил текущую конфигурацию."),
-        menuRow(),
-      );
-    }
-    return showProviderScreen(st);
-  }
-  if (action.startsWith("m:")) {
-    const option = selectWizardModel(st, action.slice("m:".length));
-    if (!option) return false;
-    if (option.reasoningLevels.length === 0) {
-      st.effort = null;
-      try {
-        await saveWizard(st);
-      } catch (e) {
-        if (!wizardIsCurrent(st)) return false;
-        if (e instanceof ModelValidationError) {
-          return showModelValidationError(st, e);
-        }
-        return endWizard(
-          st,
-          tr(
-            "Couldn't save .env: " + String(errorMessage(e)),
-            "Не удалось сохранить .env: " + String(errorMessage(e)),
-          ),
-          menuRow(),
-        );
-      }
-      // The validated configuration is durably written before any UI rendering.
-      if (!wizardIsCurrent(st)) return true;
-      await showSaved(st);
-      return true;
-    }
-    st.step = "effort";
-    return wizScreen(
-      st,
-      tr(
-        `Thinking level for ${option.id}:`,
-        `Уровень размышлений для ${option.id}:`,
-      ),
-      effortRows("iva_model", false, st.efforts),
-    );
-  }
-  if (action.startsWith("eff:")) {
-    const v = action.slice("eff:".length);
-    if (!selectWizardEffort(st, v)) return false;
-    try {
-      await saveWizard(st);
-    } catch (e) {
-      if (!wizardIsCurrent(st)) return false;
-      if (e instanceof ModelValidationError) {
-        return showModelValidationError(st, e);
-      }
-      return endWizard(
-        st,
-        tr(
-          "Couldn't save .env: " + String(errorMessage(e)),
-          "Не удалось сохранить .env: " + String(errorMessage(e)),
-        ),
-        menuRow(),
-      );
-    }
-    // The validated configuration is durably written before any UI rendering.
-    if (!wizardIsCurrent(st)) return true;
-    await showSaved(st);
-    return true;
-  }
-  if (action === "rs:later") {
-    return endWizard(
-      st,
-      tr(
-        "Saved. It'll apply after a restart (/restart).",
-        "Сохранил. Применится после перезапуска (/restart).",
-      ),
-      menuRow(),
-    );
-  }
-  if (action === "rs:now") {
-    await endWizard(
-      st,
-      tr(
-        "Restarting the agent… (~30s). The current conversation resumes after the restart.",
-        "Перезапускаю агента… (~30 сек). Текущий диалог продолжится после перезапуска.",
-      ),
-      menuRow(),
-    );
-    // Plain restart: a config change is not a recovery — parked
-    // conversations in .workflow-data survive and resume under the new model.
-    const ok = await sc("restart", "iva.service");
-    if (ok) {
-      const { provider, model, effort } = await currentConfig();
-      await reply(
-        chatId as number,
-        tr(
-          `Done — the new configuration is active: ${provider} · ${model} · thinking: ${effortLabel(effort)}.`,
-          `Готово — новая конфигурация активна: ${provider} · ${model} · размышления: ${effortLabel(effort)}.`,
-        ),
-      );
-      return true;
-    } else {
-      const failed = await reply(
-        chatId as number,
-        tr(
-          "Couldn't restart (systemctl). Check the service on the server.",
-          "Не удалось перезапустить (systemctl). Проверь сервис на сервере.",
-        ),
-      );
-      return replySucceeded(failed);
-    }
-  }
-  return false;
+  const target = await answeredStaleWizard(st, chatId, messageId);
+  if (!("live" in target)) return target.answered;
+  const live = target.live;
+  if (!wizardActionAllowed(live, action)) return false;
+  const handler = wizardHandlerFor(action);
+  if (!handler) return false;
+  return handler(live, action);
 }
 
 export function resetMessageCopy(
@@ -1080,6 +1505,12 @@ export function resetMessageCopy(
         ),
       };
 }
+
+/** Шов для теста: тот же шаг, что зовёт тап по кнопке провайдера. */
+export const wizardPickProvider = (
+  st: WizardState,
+  provider: string,
+): Promise<boolean> => pickProvider(st, provider);
 
 export {
   flows,

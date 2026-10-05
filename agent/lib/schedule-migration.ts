@@ -22,7 +22,8 @@
 // from starting.
 import { existsSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { jobFactsFile } from "./job-facts.ts";
 
 // WHEN each period fires — time of day AND day constraint — comes from the schedule table
 // the eve schedules themselves read; this module restates none of it. Table and runner are
@@ -30,13 +31,17 @@ import { join } from "node:path";
 import { SCHEDULE_CRON, parseCron } from "./schedule-table.ts";
 import type { ScheduleCron, ScheduleName } from "./schedule-table.ts";
 import {
+  JOB_STOP_GRACE_MS,
   readStatus,
   runScheduledJob,
+  type RunScheduledJobOptions,
   withStatusLock,
   writeStatusAtomic,
 } from "./schedule-runner.ts";
+import { memoryLockPath } from "./schedule-paths.ts";
+import { addDaysToDate, zonedParts, zonedToUtcMs } from "./zoned-time.ts";
 
-type Period = "daily" | "weekly" | "monthly" | "yearly";
+type Period = "night";
 
 interface ExecResult {
   readonly code: number;
@@ -103,10 +108,7 @@ export const LEGACY_MEMORY_UNITS: readonly string[] = [
 // How late a missed run may still be caught up, per period — a catch-up policy of this
 // module alone, not schedule metadata.
 const PERIOD_GRACE_MS: Record<Period, number> = {
-  daily: 20 * 60 * 60 * 1000,
-  weekly: 3 * 24 * 60 * 60 * 1000,
-  monthly: 7 * 24 * 60 * 60 * 1000,
-  yearly: 14 * 24 * 60 * 60 * 1000,
+  night: 20 * 60 * 60 * 1000,
 };
 const PERIODS = Object.keys(PERIOD_GRACE_MS) as Period[];
 
@@ -123,80 +125,6 @@ function defaultExecImpl(args: readonly string[]): ExecResult {
     out: (r.stdout || "").trim(),
     err: (r.stderr || "").trim(),
     error: r.error,
-  };
-}
-
-// ── timezone-aware "most recent due point" math ─────────────────────────────
-// No Temporal/date library dependency: derive local wall-clock Y-M-D-H-M from Intl, then
-// convert a candidate local wall-clock point back to a UTC epoch by the standard
-// guess-and-correct trick (good to the minute, which is all a memory rollup needs).
-function zonedParts(
-  epochMs: number,
-  tz: string,
-): { y: number; m: number; d: number; hh: number; mm: number; ss: number } {
-  const fmt = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    hour12: false,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-  const parts = Object.fromEntries(
-    fmt.formatToParts(new Date(epochMs)).map((p) => [p.type, p.value]),
-  );
-  // Midnight sometimes formats as "24" in en-US hour12:false — normalize to 0.
-  const hour = parts.hour === "24" ? 0 : Number(parts.hour);
-  return {
-    y: Number(parts.year),
-    m: Number(parts.month),
-    d: Number(parts.day),
-    hh: hour,
-    mm: Number(parts.minute),
-    ss: Number(parts.second),
-  };
-}
-
-function zonedToUtcMs(
-  y: number,
-  m: number,
-  d: number,
-  hh: number,
-  mm: number,
-  tz: string,
-): number {
-  let guess = Date.UTC(y, m - 1, d, hh, mm, 0);
-  for (let i = 0; i < 3; i++) {
-    const seen = zonedParts(guess, tz);
-    const seenAsUtc = Date.UTC(
-      seen.y,
-      seen.m - 1,
-      seen.d,
-      seen.hh,
-      seen.mm,
-      seen.ss,
-    );
-    const wantAsUtc = Date.UTC(y, m - 1, d, hh, mm, 0);
-    const diff = seenAsUtc - wantAsUtc;
-    if (diff === 0) break;
-    guess -= diff;
-  }
-  return guess;
-}
-
-function addDaysToDate(
-  y: number,
-  m: number,
-  d: number,
-  days: number,
-): { y: number; m: number; d: number } {
-  const shifted = new Date(Date.UTC(y, m - 1, d, 12) + days * 86_400_000); // noon avoids DST edge cases
-  return {
-    y: shifted.getUTCFullYear(),
-    m: shifted.getUTCMonth() + 1,
-    d: shifted.getUTCDate(),
   };
 }
 
@@ -314,6 +242,36 @@ function removeLegacyUnits({
   }
 }
 
+// Задание догона одного периода — то же, что у расписания, со своими путями и со сроком
+// остановки сводки (agent/lib/schedule-paths.ts): сводка гасит ход на сервере до SIGKILL.
+export function catchUpJob(
+  period: Period,
+  {
+    root,
+    nodeBin,
+    statusPath,
+    log,
+  }: {
+    readonly root: string | undefined;
+    readonly nodeBin: string;
+    readonly statusPath: string;
+    readonly log: (...args: unknown[]) => void;
+  },
+): RunScheduledJobOptions {
+  return {
+    name: statusKey(period),
+    argv: ["scripts/memory/night.ts"],
+    root,
+    nodeBin,
+    lockPath: root ? memoryLockPath(root) : undefined,
+    statusPath,
+    factsPath: jobFactsFile(dirname(statusPath)),
+    killGraceMs: JOB_STOP_GRACE_MS,
+    wake: false,
+    log,
+  };
+}
+
 export async function runScheduleMigration({
   homedir,
   execImpl = defaultExecImpl,
@@ -331,15 +289,9 @@ export async function runScheduleMigration({
     const runPeriod =
       runJob ??
       ((period: Period) =>
-        runScheduledJob({
-          name: statusKey(period),
-          argv: ["scripts/memory/rollup.ts", period],
-          root,
-          nodeBin,
-          lockPath: root ? join(root, ".memory.lock") : undefined,
-          statusPath,
-          log,
-        }));
+        runScheduledJob(
+          catchUpJob(period, { root, nodeBin, statusPath, log }),
+        ));
 
     // Per-key seed, the seed write, AND the due-check all happen inside the
     // SAME single lock acquisition runScheduledJob's own admission check uses — never
@@ -360,7 +312,18 @@ export async function runScheduleMigration({
           );
           return { action: "defer" };
         }
-        const current: MigrationStatus = readStatus(statusPath);
+        let current: MigrationStatus;
+        try {
+          current = readStatus(statusPath);
+        } catch (error) {
+          // Seeding over a status we could not read would tell every period "you never
+          // ran" and fire a catch-up burst off it. Defer the pass like the lock-less
+          // path above.
+          log(
+            `schedule-migration: deferring this pass — ${(error as Error).message} (retried on the next boot)`,
+          );
+          return { action: "defer" };
+        }
         const nowMs = now();
         const seeded: MigrationStatus = { ...current };
         const freshlySeeded = new Set<Period>();

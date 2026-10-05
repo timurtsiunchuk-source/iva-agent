@@ -19,13 +19,10 @@ const screen = loaded.default as Screen;
 
 after(() => rmSync(dataDir, { recursive: true, force: true }));
 
-type Button = { text: string; callback_data: string };
-type View = { text: string; rows: Button[][] };
+type View = { text: string };
 type MenuState = { page: number };
 type MenuContext = {
   tr: (english: string, russian: string) => string;
-  btn: (text: string, callbackData: string) => Button;
-  backRow: (screenId: string) => Button[];
   show: (state: MenuState, screenId: string) => Promise<void>;
 };
 type Screen = {
@@ -55,10 +52,6 @@ function readSettingsFile(): Record<string, unknown> {
 function makeContext(lang: string, redrawn: string[] = []): MenuContext {
   return {
     tr: (english, russian) => (lang === "ru" ? russian : english),
-    btn: (text, callbackData) => ({ text, callback_data: callbackData }),
-    backRow: (screenId) => [
-      { text: "Back", callback_data: `iva_menu:${screenId}:o` },
-    ],
     show: (_state, screenId) => {
       redrawn.push(screenId);
       return Promise.resolve();
@@ -66,10 +59,17 @@ function makeContext(lang: string, redrawn: string[] = []): MenuContext {
   };
 }
 
-const labels = (view: View) =>
-  view.rows.flat().map((button) => [button.text, button.callback_data]);
+// Кнопка — тег в markdown: подпись и data достаём из строки.
+const buttonsOf = (text: string): Array<[string, string]> =>
+  [
+    ...text.matchAll(
+      /<tg-button[^>]*data="([^"]+)"[^>]*>([^<]*)<\/tg-button>/g,
+    ),
+  ].map((match) => [match[2], match[1]] as [string, string]);
 
-test("both toggles render off on a fresh installation, in either language", () => {
+const labels = (view: View) => buttonsOf(view.text);
+
+test("reports render off and Watch on on a fresh installation, in either language", () => {
   rmSync(settingsPath, { force: true });
 
   const russian = screen.render({ page: 3 }, makeContext("ru"));
@@ -80,32 +80,56 @@ test("both toggles render off on a fresh installation, in either language", () =
   );
   assert.deepEqual(labels(russian), [
     ["○ Отчёты памяти", "iva_menu:ntc:set:rep:1"],
-    ["○ Утренний дайджест", "iva_menu:ntc:set:dig:1"],
-    ["Back", "iva_menu:r:o"],
+    ["✓ Сама пишет", "iva_menu:ntc:set:pro:0"],
+    ["‹ Меню", "iva_menu:r:o"],
   ]);
+  assert.match(
+    russian.text,
+    /Присмотр за пропущенным и обзор дня\. О сбоях пишу всегда\./,
+  );
+  // Строка дайджеста ушла: её место — времена Brief из настроек.
+  assert.match(russian.text, /Обзор дня: 08:30 и 14:00/u);
+  assert.doesNotMatch(russian.text, /дайджест/iu);
 
   const english = screen.render({ page: 0 }, makeContext("en"));
   assert.match(english.text, /🔔 Notices/);
   assert.match(english.text, /Alerts — problems and updates — always arrive/);
   assert.deepEqual(labels(english), [
     ["○ Memory reports", "iva_menu:ntc:set:rep:1"],
-    ["○ Morning digest", "iva_menu:ntc:set:dig:1"],
-    ["Back", "iva_menu:r:o"],
+    ["✓ Writes on her own", "iva_menu:ntc:set:pro:0"],
+    ["‹ Menu", "iva_menu:r:o"],
   ]);
+  assert.match(
+    english.text,
+    /Watch for missed items and the daily brief\. Failures are always reported\./,
+  );
+  assert.match(english.text, /Daily brief: 08:30 and 14:00/u);
+  assert.doesNotMatch(english.text, /digest/iu);
   assert.equal(screen.parent, "r");
 });
 
 test("a switched-on toggle is ticked and offers the way back off", () => {
   writeSettingsFile({
     memoryReports: { enabled: true },
-    digestSchedule: { enabled: true },
+    // Не больше двух Brief в сутки: три времени — уже значение по умолчанию.
+    proactive: { enabled: false, briefTimes: ["09:00", "18:00"] },
   });
 
-  assert.deepEqual(labels(screen.render({ page: 0 }, makeContext("ru"))), [
+  const view = screen.render({ page: 0 }, makeContext("ru"));
+  assert.deepEqual(labels(view), [
     ["✓ Отчёты памяти", "iva_menu:ntc:set:rep:0"],
-    ["✓ Утренний дайджест", "iva_menu:ntc:set:dig:0"],
-    ["Back", "iva_menu:r:o"],
+    ["○ Сама пишет", "iva_menu:ntc:set:pro:1"],
+    ["‹ Меню", "iva_menu:r:o"],
   ]);
+  assert.match(view.text, /Обзор дня: 09:00 и 18:00/u);
+});
+
+test("a tap on the old digest toggle from a stale screen changes nothing", async () => {
+  writeSettingsFile({ language: "en" });
+  const redrawn: string[] = [];
+  await screen.on("set", ["dig", "1"], { page: 0 }, makeContext("ru", redrawn));
+  assert.deepEqual(readSettingsFile(), { language: "en" });
+  assert.deepEqual(redrawn, []);
 });
 
 test("a toggle writes its own key and leaves the neighbours alone", async () => {
@@ -114,7 +138,6 @@ test("a toggle writes its own key and leaves the neighbours alone", async () => 
   // вложенный объект целиком, а не переписывать его одним своим полем.
   writeSettingsFile({
     language: "en",
-    digestSchedule: { enabled: true },
     memoryReports: { enabled: false, chatId: "123" },
   });
   const redrawn: string[] = [];
@@ -124,17 +147,26 @@ test("a toggle writes its own key and leaves the neighbours alone", async () => 
 
   assert.deepEqual(readSettingsFile(), {
     language: "en",
-    digestSchedule: { enabled: true },
     memoryReports: { enabled: true, chatId: "123" },
   });
   assert.deepEqual(redrawn, ["ntc"], "the screen redraws itself, not the root");
+});
 
-  await screen.on("set", ["dig", "0"], { page: 0 }, context);
+test("«Сама пишет» writes proactive.enabled and keeps the Watch settings beside it", async () => {
+  writeSettingsFile({
+    language: "en",
+    proactive: { watchCapPerDay: 3, urgentSenders: ["wife"] },
+  });
+  await screen.on("set", ["pro", "0"], { page: 0 }, makeContext("ru"));
   assert.deepEqual(readSettingsFile(), {
     language: "en",
-    digestSchedule: { enabled: false },
-    memoryReports: { enabled: true, chatId: "123" },
+    proactive: { watchCapPerDay: 3, urgentSenders: ["wife"], enabled: false },
   });
+  await screen.on("set", ["pro", "1"], { page: 0 }, makeContext("ru"));
+  assert.equal(
+    (readSettingsFile().proactive as { enabled?: unknown }).enabled,
+    true,
+  );
 });
 
 test("a stale tap sets the value it carries instead of flipping twice", async () => {

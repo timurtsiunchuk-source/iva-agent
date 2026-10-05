@@ -14,7 +14,12 @@ import {
   removeTelegramJob,
   reporterFor,
 } from "../lib/telegram-status.ts";
-import { resolveUpdateTarget } from "../lib/update-channel.ts";
+import {
+  BETA_CONFIG,
+  betaChannel,
+  BranchUnavailableError,
+  resolveReleaseTarget,
+} from "../lib/update-channel.ts";
 import {
   gitAt,
   installedVersion,
@@ -22,7 +27,7 @@ import {
   requireGit,
   updaterTooOldMessage,
 } from "../lib/update-check.ts";
-import { catalogProvider } from "../lib/model-catalog.ts";
+import { CATALOG, catalogProvider } from "../lib/model-catalog.ts";
 import { classifyRoot, isManagedInstall } from "../lib/version-layout.ts";
 import {
   acquireUpdateLock,
@@ -38,9 +43,56 @@ import {
   type UpdateOutcome,
 } from "../lib/version-update.ts";
 import type { createCliRuntime } from "./runtime.ts";
-import { ACCEPTED_PROVIDERS, COPY, invalidProviderRefusal } from "./update.ts";
 
 type CliRuntime = ReturnType<typeof createCliRuntime>;
+
+type UpdateCopy = Record<"fetch" | "build", readonly [string, string]> & {
+  readonly current: string;
+  readonly busy: string;
+  readonly badProvider: string;
+  readonly devCheckout: string;
+  readonly failed: string;
+  readonly stock: string;
+};
+
+/** What the terminal says; the chat has its own words in telegram-status.ts. */
+const COPY: Record<"en" | "ru", UpdateCopy> = {
+  ru: {
+    fetch: ["Получаю обновление", "Обновление получено"],
+    build: ["Собираю Iva", "Iva собрана"],
+    current: "Iva уже обновлена",
+    busy: "Обновление уже идёт",
+    badProvider:
+      "Сначала почини MODEL_PROVIDER в .env (iva config) — на этом значении Iva не стартует",
+    devCheckout:
+      "это чекаут разработчика (.iva-dev): обновляйся через git, собирай `npm run build`",
+    failed: "Не удалось завершить обновление",
+    stock: "ваша доработка в data/custom не входит в эту версию",
+  },
+  en: {
+    fetch: ["Getting the update", "Update received"],
+    build: ["Building Iva", "Iva built"],
+    current: "Iva is already up to date",
+    busy: "An update is already running",
+    badProvider:
+      "Fix MODEL_PROVIDER in .env first (iva config) — Iva won't start on this value",
+    devCheckout:
+      "this is a development checkout (.iva-dev): update it with git, build it with `npm run build`",
+    failed: "Couldn't complete the update",
+    stock: "your customization in data/custom is not in this version",
+  },
+};
+
+/** Имена, которые примет рантайм, — для сообщения об отказе. */
+const ACCEPTED_PROVIDERS = Object.keys(CATALOG).join(", ");
+
+/**
+ * Отказ апдейта на невалидном MODEL_PROVIDER. В терминал он идёт на языке CLI
+ * (AGENT_LANGUAGE), в чат — из copy репортера (job.locale).
+ */
+function invalidProviderRefusal(text: UpdateCopy, value: string): string {
+  return `${text.badProvider}: ${JSON.stringify(value)} (${ACCEPTED_PROVIDERS})`;
+}
 
 /**
  * What `iva plugin` learns from a build it asked for (ADR-0009). `skipped` is a
@@ -98,14 +150,17 @@ export async function ensureMirror(home: string): Promise<string> {
   rmSync(staging, { recursive: true, force: true });
   const git = (root: string, args: string[]): Promise<string> =>
     requireGit(gitAt, root, args);
-  const key = "iva.updateBranch"; // What the installation follows, not the clone.
+  // What the installation follows, not the clone: its branch and beta updates.
+  const keys = ["iva.updateBranch", BETA_CONFIG];
   try {
     await git(home, ["clone", "--mirror", join(home, ".git"), staging]);
     const origin = await git(home, ["remote", "get-url", "origin"]);
     await git(staging, ["remote", "set-url", "origin", origin]);
-    const branch = (await gitAt(home, ["config", "--local", "--get", key]))
-      .stdout;
-    if (branch) await git(staging, ["config", key, branch]);
+    for (const key of keys) {
+      const value = (await gitAt(home, ["config", "--local", "--get", key]))
+        .stdout;
+      if (value) await git(staging, ["config", key, value]);
+    }
     renameSync(staging, repo);
   } catch (error) {
     rmSync(staging, { recursive: true, force: true });
@@ -115,27 +170,92 @@ export async function ensureMirror(home: string): Promise<string> {
 }
 
 /**
- * What the next version is built from. An unreachable remote is not a failure: the
- * newest mirrored commit is the honest answer, so an offline update is a no-op.
+ * What the next version is built from: the newest release, or the tip with beta updates
+ * on (ADR-0017, ADR-0018). Neither guesses: offline, with no beta branch or with no
+ * release tag it refuses. `installed` is the commit that runs; no update goes below it.
  */
 export async function resolveTarget(
   repo: string,
-): Promise<{ sha: string; version: string }> {
-  let sha = "";
+  installed?: string,
+): Promise<ReleaseAim> {
+  const git = (...args: string[]) => gitAt(repo, args);
+  let target: Awaited<ReturnType<typeof resolveReleaseTarget>>;
   try {
-    const target = await resolveUpdateTarget({
-      git: (...args) => gitAt(repo, args),
-    });
-    sha = target.targetHead ?? "";
-  } catch {
-    // Offline, or a remote that refuses the fetch.
+    target = await resolveReleaseTarget({ git, installed });
+  } catch (error) {
+    // Бета без ветки (нет сети или ветки): HEAD зеркала — это main, то есть откат.
+    if (!(error instanceof BranchUnavailableError)) throw error;
+    if (!(await betaChannel(git))) throw error;
+    throw new Error(
+      "the beta branch is unavailable (no network or no such branch); nothing was installed",
+      { cause: error },
+    );
   }
-  if (!sha) sha = await requireGit(gitAt, repo, ["rev-parse", "HEAD"]);
+  const [sha, beta] = [target.targetHead, target.beta];
+  const [release, newer] =
+    "tag" in target ? [target.tag, target.newer] : [undefined, false];
   const version = packageVersion(
     await requireGit(gitAt, repo, ["show", `${sha}:package.json`]),
   );
   if (!version) throw new Error(`no package version at ${sha}`);
-  return { sha, version };
+  return { sha, version, beta, release, newer };
+}
+
+/** Цель `iva update`: `release` — новейший выпуск, `newer` — установка новее него. */
+type ReleaseAim = {
+  sha: string;
+  version: string;
+  beta: boolean;
+  release?: string;
+  newer?: boolean;
+};
+
+/** Строка под «уже обновлена» без бета-обновлений: стоит выпуск или сборка новее него. */
+export function releaseNote(aim: ReleaseAim, locale: string): string | null {
+  if (aim.beta) return null;
+  const ru = locale === "ru";
+  if (!aim.newer)
+    return ru
+      ? "Это последняя стабильная версия."
+      : "That is the latest stable release.";
+  return ru
+    ? `Стоит сборка новее последнего выпуска (${aim.release}). Следующий выпуск поставлю, когда выйдет.`
+    : `This build is newer than the latest release (${aim.release}). I'll install the next release when it's out.`;
+}
+
+/** The commit that runs: the active version's, else the checkout's own HEAD. */
+async function installedCommit(home: string): Promise<string | undefined> {
+  const active = createVersionStore(home).currentName();
+  const at = active ? parseVersionName(active)?.sha : undefined;
+  return at ?? ((await gitAt(home, ["rev-parse", "HEAD"])).stdout || undefined);
+}
+
+/**
+ * `iva update` by release: the target is resolved from the commit that runs, and one
+ * already on its newest release says so under the "up to date" line.
+ */
+function releaseUpdate(home: string) {
+  let aim: ReleaseAim | undefined;
+  return {
+    target: async (repo: string) => {
+      aim = await resolveTarget(repo, await installedCommit(home));
+      return aim;
+    },
+    said: (outcome: UpdateOutcome | null, env: Record<string, string>) => {
+      const language = env.AGENT_LANGUAGE || process.env.AGENT_LANGUAGE;
+      const note = aim && releaseNote(aim, language === "ru" ? "ru" : "en");
+      if (outcome?.status === "current" && note) console.log(`   ${note}`);
+    },
+  };
+}
+
+/** The job file of a `/update --force` from the chat carries the flag. */
+function jobAsksForce(job: unknown): boolean {
+  return (
+    typeof job === "object" &&
+    job !== null &&
+    (job as { force?: unknown }).force === true
+  );
 }
 
 /**
@@ -160,9 +280,6 @@ export function createVersionUpdateCommand(
     { requirePlugins = false }: { readonly requirePlugins?: boolean } = {},
   ): Promise<UpdateOutcome | null> {
     const verbose = args.includes("--verbose");
-    // Decided here and never travelling: a build of this release already on disk
-    // may not be reused.
-    const force = args.includes("--force");
     const jobAt = args.indexOf("--telegram-job");
     const env = runtime.readEnv();
     const language = env.AGENT_LANGUAGE || process.env.AGENT_LANGUAGE;
@@ -172,24 +289,47 @@ export function createVersionUpdateCommand(
       runtime.dataDirAbs(env),
       jobAt >= 0 ? (args[jobAt + 1] ?? "") : "",
     );
+    // Decided here and never travelling: a build of this release already on disk
+    // may not be reused. `/update --force` from the chat writes the flag into its
+    // job, so the retry of an interrupted run rebuilds too.
+    const force = args.includes("--force") || jobAsksForce(job?.job);
     const reporter = job
       ? reporterFor(job.job, env.TELEGRAM_BOT_TOKEN, env)
       : null;
-    // Тот же префлайт, что на legacy-пути, и на боевом он именно этот: managed-layout —
-    // всё, что стоит через install.sh. Без него опечатка в MODEL_PROVIDER прогоняла
-    // fetch → build → restart → health-fail и возвращала «Couldn't build Iva … Retry:
-    // /update» по кругу, ни разу не назвав причину. Отказ до зеркала, до лока и до первой
-    // записи — установка остаётся нетронутой (ADR-0003).
-    const configuredProvider = env.MODEL_PROVIDER ?? "ollama";
-    if (!catalogProvider(configuredProvider)) {
-      terminal.fail(invalidProviderRefusal(text, configuredProvider));
-      await reporter?.badProvider(configuredProvider, ACCEPTED_PROVIDERS);
+    /**
+     * Отказ до зеркала, до лока и до первой записи: установка остаётся нетронутой
+     * (ADR-0003). Причина уходит и в терминал, и в чат, а job закрывается: /update
+     * из Telegram отказывал только в терминал systemd-run, которого никто не видит,
+     * и мост, не найдя ни лока, ни outcome, оставлял «Запускаю обновление»
+     * висеть в чате до шестичасового TTL.
+     */
+    const refuse = async (
+      line: string,
+      chat?: Promise<void>,
+    ): Promise<null> => {
+      terminal.fail(line);
+      await chat;
       terminal.dispose();
       reporter?.dispose();
       await removeTelegramJob(job?.path);
       process.exitCode = 1;
       return null;
-    }
+    };
+
+    // Обновляется всё, кроме дерева, которое владелец сам помеченным `.iva-dev`
+    // объявил своим рабочим: его оставляют как есть.
+    if (!isManagedInstall(install))
+      return refuse(text.devCheckout, reporter?.devCheckout());
+
+    // Без этого префлайта опечатка в MODEL_PROVIDER прогоняла fetch → build → restart →
+    // health-fail и возвращала «Couldn't build Iva … Retry: /update» по кругу, ни разу
+    // не назвав причину.
+    const configuredProvider = env.MODEL_PROVIDER ?? "ollama";
+    if (!catalogProvider(configuredProvider))
+      return refuse(
+        invalidProviderRefusal(text, configuredProvider),
+        reporter?.badProvider(configuredProvider, ACCEPTED_PROVIDERS),
+      );
 
     const store = createVersionStore(install.home);
     // The last version the installation actually settled on: after an interrupted
@@ -219,11 +359,12 @@ export function createVersionUpdateCommand(
     try {
       terminal.start(text.fetch[0]);
       await reporter?.start("fetch");
-      const repo = await ensureMirror(install.home);
       const outcome = await runVersionUpdate({
         home: install.home,
         store,
-        resolveTarget: () => target(repo),
+        // Зеркало клонируется под локом, а не до него: пока лок чужой, клон истории -
+        // работа впустую и второй rename рядом с чужим обновлением.
+        resolveTarget: async () => target(await ensureMirror(install.home)),
         run: commandRunner(verbose),
         force,
         requirePlugins,
@@ -294,7 +435,8 @@ export function createVersionUpdateCommand(
   }
 
   async function run(args: readonly string[]): Promise<void> {
-    await pipeline(args, resolveTarget);
+    const update = releaseUpdate(install.home);
+    update.said(await pipeline(args, update.target), runtime.readEnv());
   }
 
   /**
@@ -347,7 +489,7 @@ export function createVersionUpdateCommand(
       return {
         status: "skipped",
         reason:
-          "plugin code is built into a version, and this tree is a development checkout - build it yourself: npm run build",
+          "plugin code is built into a version, and this tree is a development checkout (.iva-dev) - build it yourself: npm run build",
       };
     const outcome = await pipeline([], currentTarget, { requirePlugins });
     if (!outcome)
@@ -452,8 +594,6 @@ export function createVersionUpdateCommand(
   }
 
   return {
-    /** Only a real installation is converted; a development checkout is left alone. */
-    active: (): boolean => isManagedInstall(install),
     run,
     rebuild,
     rollback,

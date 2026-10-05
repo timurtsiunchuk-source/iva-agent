@@ -5,10 +5,14 @@ refreshed by releases; your custom layer lives in `data/custom/agent/`. `npm run
 a disposable tree, then `iva restart` activates the result ([cli.md](./cli.md)). The live source checkout
 stays clean, so an update cannot be blocked by a customized skill or HTML file. Local edits you already
 made to `agent/instructions.md`, `agent/connections/`, `agent/tools/` or `agent/subagents/` move into
-the custom layer automatically on the first update. Skills are the exception: they are read straight
-off disk at run time and never go through a build (see below). Edits anywhere else in
-the tree stay a plain local patch: the updater stashes them and replays them onto the new revision, and
-archives them under `data/update-conflicts/` when they no longer apply.
+the custom layer automatically on the first update - a `data/custom/agent/instructions.md`
+that arrived that way is the deprecated replacement persona: `iva doctor` names it, and
+"Your rules" below shows the way off it. Skills and the markdown owner rules are the exception:
+they are read straight off disk at run time and never go through a build (see below). Edits anywhere else in
+the tree are not carried over: an update installs the release as it is, so keep what is yours in
+`data/custom/` - skills, tools, plugins - where a release never touches it. Working on Iva's own code
+instead? Put an empty `.iva-dev` file in the root of the checkout: `iva update` then refuses it and the
+tree is yours to `git pull` and `npm run build` by hand.
 
 A capability can also arrive packaged: a plugin is a folder with skills, code and MCP servers
 that installs with one command and leaves with another, into the same custom layer. This page is
@@ -22,7 +26,7 @@ condition ("Use when…"), not a summary. Two shapes work: a flat `<name>.md`, o
 with a `SKILL.md` plus supporting files. Iva loads both your custom skills and the bundled skills in
 `agent/skills/`; bundled skills are read-only templates, simplest first:
 
-- 📋 **morning-digest.md** — one tool call (`tasks`), grouping rules, output format. Copy this for any "call a tool, format the result" job.
+- 📋 **brief/** — walks tasks, calendar, mail and every Connection, then writes one overview plus one message per action. Copy this for any "gather, judge, report" job.
 - 🔎 **web-research.md** — a 4-step chain: `web_search` → pick 2–4 sources → `web_fetch` each → synthesize with links.
 - 🌐 **agent-browser/** — directory skill wrapping a CLI the model drives through `bash`.
 - 🛡 **security-defense/** — a procedure plus data: `SKILL.md`, a patterns file for reviewing a command by eye, and the secret-key inventory the runtime gate reads.
@@ -41,9 +45,8 @@ those still need `iva update`.
 ⚠️ Your skills go in `data/custom/agent/skills/` and nowhere else - never in a `.claude/` directory
 (`~/.claude/skills/`, `vault/.claude/skills/`). That is a different tool's layout; Iva does not read it.
 
-If Iva should reach for your skill unprompted, name it in
-`data/custom/agent/instructions.md`. Copy `agent/instructions.md` there before the first edit if the
-custom file does not exist yet.
+If Iva should reach for your skill unprompted, name it in a file under
+`data/custom/agent/instructions/`.
 
 ## MCP connections
 
@@ -92,18 +95,64 @@ outputSchema: z.object({
 
 A subagent runs on the main provider: the planner takes its model straight from `agent/provider.ts`, so `MODEL_PROVIDER` picks the model for every node of the graph at once. Subagents deliberately keep no provider or env of their own — one selection, one identity, one usage line.
 
-## Changing the character
+## Your rules
 
-Iva's voice lives in exactly one customizable file: `data/custom/agent/instructions.md` - tone, rules,
-tool preferences and hard limits. Start by copying the bundled `agent/instructions.md`. The reply
-language still comes from `AGENT_LANGUAGE` in `.env`. The files in `agent/instructions/` stay in the
-authored tree and are not part of the custom layer.
+Your own rules live next to the bundled persona, in `data/custom/agent/instructions/`.
 
-If an upstream edit overlaps yours, Iva activates the new authored tree and saves all three versions
-(base, yours, upstream) under `data/update-conflicts/`. Tell Iva "restore my update changes" or «верни
-мои изменения после обновления» to load the recovery skill and merge them from chat.
+Every markdown file there is read straight off disk on every turn - no rebuild, no restart, the
+same way skills work. Rules load in file-name order, so prefix a name when the order matters
+(`10-tone.md`). The whole directory shares one cap of 4 000 characters: `iva doctor` prints the
+current count and warns when the sum goes over.
 
-What Iva knows about _you_ is memory, not code — that's `CORE.md` in the vault ([memory.md](./memory.md)).
+In the chat, "remember a rule: answer with a one-line summary first" is enough. Iva confirms
+what she heard and, after your yes, writes it into `rules.md` there through `write_file` -
+she asks first because the rule loads on the very next turn, and she does not edit files
+behind your back.
+
+A rule of behaviour is not CORE: CORE holds standing facts and goals, the reply style comes
+from the `/menu` quiz, and rules live here.
+
+`.ts` files in the same directory are dynamic instruction sources, like the bundled
+`agent/instructions/20-core.ts`: only `eve`, local packages, `agent/lib` and node
+`fs`/`path` may be imported there, and they go through `npm run build` - unlike the markdown files beside them.
+A name already taken by a bundled file in `agent/instructions/` is refused by the build with
+the path - rename the file.
+
+### The replaced persona
+
+`data/custom/agent/instructions.md` is the old way: it **replaces** the bundled
+`agent/instructions.md` whole. Your copy froze on the day you wrote it, and every rule shipped
+since - delivery, reminders, the tool policy - never reaches the model. `iva doctor` warns when
+the file exists. On a Version install the file is copied as is; on a checkout the updater
+merges the three versions (base, yours, upstream) and a full rewrite conflicts.
+
+Moving off it:
+
+1. See what is actually yours. Iva keeps the base your file replaced; the manifest records
+   which blob it was built from, and the blob sits next to it:
+
+   ```bash
+   cd ~/iva            # or your checkout
+   base=$(node -e 'const m=require("./data/custom/manifest.json");console.log(m.entries["agent/instructions.md"].baseBlob)')
+   diff -u "data/custom/bases/$base" data/custom/agent/instructions.md
+   ```
+
+2. Keep the red lines no release can know - tone, report shape, hosts and paths of your
+   machine, personal integrations. Drop everything the bundled persona already says and every
+   recipe that has since become wrong (a script that sends to Telegram itself, a shell timer,
+   a removed command).
+
+3. Write what is left into `data/custom/agent/instructions/rules.md` and remove the
+   replacement: `rm data/custom/agent/instructions.md`. Then `iva update --force` on a Version
+   install, or `npm run build` and `/restart` in the chat on a checkout. The bundled persona
+   comes back and your rules ride next to it.
+
+4. Check the result: `grep -c "Owner rules" ~/iva/current/agent/instructions.md` prints 1, and
+   asking Iva "what are your rules for reports?" returns what you wrote.
+
+5. `iva rollback` flips back to the version that ran before if something is off.
+
+What Iva knows about _you_ is memory, not code - that's `CORE.md` in the vault ([memory.md](./memory.md)).
 
 ## Local development
 
@@ -125,6 +174,10 @@ console.log((await res.result()).message);
 
 One gotcha — Iva runs eve **0.51.1**:
 
-- 🩹 **patch-package** — `patches/eve+0.51.1.patch` makes deterministic model-call errors (invalid prompt, unknown tool) fail fast instead of parking a poisoned session. It also preserves the structured HTTP status from `web_fetch`, keeps the dynamic "Available skills" announcement in the system prompt instead of a user message, and falls back to `/workspace/skills` when the sandbox reports `HOME=/` (upstream vercel/eve#2839, PR #2841; contract test `scripts/eve-skill-announcement.test.ts`). If you bump Eve, regenerate the patch or drop each edit only after its targeted contract test passes against upstream.
+- 🩹 **patch-package** — `patches/eve+0.51.1.patch` makes deterministic model-call errors (invalid prompt, unknown tool) fail fast instead of parking a poisoned session. It also preserves the structured HTTP status from `web_fetch`, keeps the dynamic "Available skills" announcement in the system prompt instead of a user message, and falls back to `/workspace/skills` when the sandbox reports `HOME=/` (upstream vercel/eve#2839, PR #2841; contract test `scripts/eve-skill-announcement.test.ts`). A second hunk makes the `AGENT_BUSY` message name the next step: end the turn, since the task result arrives after it, or stop the task with `task_cancel` (upstream issue: pending; hunk test `scripts/eve-agent-busy.test.ts`; drop it on the Eve bump whose busy message names a next step in any wording). If you bump Eve, regenerate the patch or drop each edit only after its targeted contract test passes against upstream.
 
-The Eve 0.11.4 schedule crash (`eve dev` dying when a schedule handler imported another authored module) is fixed since 0.27.8. Iva now ships five `agent/schedules/*.ts` handlers: four memory rollups and the opt-in digest. On a VPS they run in the `iva.service` process; the two remaining systemd timers are watchdogs for the nightly Brain pass and update-check ([deploy.md](./deploy.md)).
+The patch also lets a manual session compaction (`compact()`) resolve a model that only a `step.started` resolver provides: upstream reads the model without dispatching that event and fails with "Dynamic model selection is required", so Iva's compaction between turns could never run (contract test `scripts/eve-manual-compaction.test.ts`; remove the hunk when eve dispatches the step resolver for `compactOnly` itself).
+
+The same patch makes Eve the only transport retry owner: the SDK retry count is zero, and Eve makes at most three model-call attempts with default waits of 5s and 15s. Provider Retry-After minimums share that 20s total wait allowance; a longer required wait parks the turn instead of retrying early. Only failures before a stream opens are retried; transport retries never replay an opened stream or completed generation. Backoff is cancelled with the turn, and exhausted chat turns remain ready for the next user message. The boundary tests are `scripts/eve-model-retry.test.ts`; upstream tracking is [vercel/eve#3984](https://github.com/vercel/eve/issues/3984) and [#2320](https://github.com/vercel/eve/issues/2320). Remove these retry-owner and stream-observation changes when those contracts pass against unpatched upstream, preserving unrelated patch changes. This focused successor was inspired by [@qwin2k's PR #251](https://github.com/smixs/iva-agent/pull/251).
+
+The Eve 0.11.4 schedule crash (`eve dev` dying when a schedule handler imported another authored module) is fixed since 0.27.8. Iva's in-process Eve schedules are `memory-night.ts`, `proactive.ts`, `reminders.ts` and `jobs-watchdog.ts` under `agent/schedules/`. On a VPS they run inside `iva.service` ([deploy.md](./deploy.md)).

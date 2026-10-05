@@ -20,6 +20,7 @@ import {
   sleep,
 } from "./config.ts";
 import { tg } from "./transport.ts";
+import { noteDroppedBridgeTasks, scheduleBridgeTask } from "./background.ts";
 import { fastForwardOffset, saveOffset } from "./offset.ts";
 import {
   admitTelegramUpdate,
@@ -63,7 +64,8 @@ const {
   retireSettledSessions,
 } = queue;
 const { drainReadyQueueHeads, routeMessageUpdate } = routing;
-const { reconcileUpdateJobs, removeStaleUpdateJobs } = updateFlow;
+const { launchSelfUpdate, reconcileUpdateJobs, removeStaleUpdateJobs } =
+  updateFlow;
 const { handleControl, registerBotCommands } = control;
 
 export { readCappedStream } from "./transport.ts";
@@ -194,11 +196,15 @@ export async function processTelegramUpdate(
     return { offset: nextOffset, ingressBlocked: false };
   }
   const admitted = await admitImpl(update);
-  if (admitted === "write-failed" || admitted === "unownable") {
-    if (admitted === "unownable") {
-      logImpl(`update ${update.update_id} has no durable ingress key`);
-    }
+  // write-failed транзиентен: диск может ожить, повтор обязателен и вход ждёт.
+  if (admitted === "write-failed") {
     return { offset, ingressBlocked: true };
+  }
+  // unownable структурен и постоянен: повтор не сделает апдейт опознаваемым, а
+  // задержанный offset крутит один и тот же батч вечно. Подтверждаем и идём дальше;
+  // строка в журнале называет update_id и причину.
+  if (admitted === "unownable") {
+    logImpl(`update ${update.update_id} has no durable ingress key`);
   }
   const nextOffset = update.update_id + 1;
   if (admitted === "terminal-drop") {
@@ -221,8 +227,8 @@ async function reconcileResetIntentsSafely(): Promise<number> {
   }
 }
 
-let resetIntentReconciliationInFlight: Promise<void> | null = null;
-
+// Сверка интентов сброса — фоновая задача моста из общего слота (background.ts): приём один
+// на всех, второй такой же ключ во время работы получает false.
 export function scheduleResetIntentReconciliation({
   reconcileImpl = reconcileResetIntentsSafely,
   logImpl = log,
@@ -230,20 +236,16 @@ export function scheduleResetIntentReconciliation({
   reconcileImpl?: () => Promise<number>;
   logImpl?: (...args: unknown[]) => void;
 } = {}): boolean {
-  if (resetIntentReconciliationInFlight) return false;
-  resetIntentReconciliationInFlight = reconcileImpl()
-    .then((count) => {
+  return scheduleBridgeTask(
+    "reset-intents",
+    async () => {
+      const count = await reconcileImpl();
       if (count > 0) {
         logImpl(`reconciled ${count} durable private Telegram reset intent(s)`);
       }
-    })
-    .catch((error: unknown) => {
-      logImpl("reset intent background task failed:", errorMessage(error));
-    })
-    .finally(() => {
-      resetIntentReconciliationInFlight = null;
-    });
-  return true;
+    },
+    { logImpl },
+  );
 }
 
 async function deleteWebhookOrThrow(
@@ -289,7 +291,7 @@ export async function main({
   // The update that restarted this bridge left its final screen to us: its own
   // process died with the restart. Delivered before the first poll; the jobs with
   // nothing to say yet are watched beside it.
-  const watched = await reconcileUpdateJobs();
+  const watched = await reconcileUpdateJobs({ launchImpl: launchSelfUpdate });
   if (watched.length > 0)
     log(`watching ${watched.length} unfinished update job(s)`);
   // Upgrade the old {chatKey: string[]} queue atomically before polling. A failed
@@ -434,6 +436,13 @@ export function runEntrypoint(
   executedPath: string | undefined = process.argv[1],
 ): void {
   if (fileURLToPath(moduleUrl) !== executedPath) return;
+  // У остановки моста нет своего пути завершения: задачи в полёте умирают вместе с процессом.
+  // Скажем об этом в журнал и пропустим сигнал дальше — обработчик снят, и повторный SIGTERM
+  // убивает процесс как раньше, иначе systemd ждал бы нас до SIGKILL.
+  process.once("SIGTERM", () => {
+    noteDroppedBridgeTasks({ logImpl: log });
+    process.kill(process.pid, "SIGTERM");
+  });
   void main().catch((error: unknown) => {
     console.error("telegram-poll fatal:", error);
     process.exit(1);

@@ -1,7 +1,8 @@
 /* eslint-disable @typescript-eslint/no-floating-promises, @typescript-eslint/require-await -- Node's test runner owns registrations and injected service doubles preserve asynchronous boundaries. */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,7 +23,7 @@ import {
   startProcess,
   type RunOptions,
 } from "./svc-run.ts";
-import { acquireUpdateLock, releaseUpdateLock } from "../update-safety.ts";
+import { acquireUpdateLock } from "../version-store.ts";
 import { createFlows } from "../tg-flow.ts";
 
 const { SCREENS } = (await import("./index.ts")) as {
@@ -43,60 +44,54 @@ type TestState = MenuServiceState & {
 };
 type TelegramBody = Record<string, unknown> & {
   text?: string;
-  entities?: Array<{ custom_emoji_id?: string }>;
-  reply_markup?: unknown;
+  rich_message?: { markdown?: string };
 };
-type TelegramCall = { method: string; body: TelegramBody };
 type Harness = {
   ctx: MenuServiceContext;
   rendered: MenuServiceView[];
-  tgCalls: TelegramCall[];
   st: TestState | null;
 };
 type TestDeps = Partial<MenuServiceContext["deps"]>;
 
-// стенд как в menu-screens.test.ts + захват прямых tg-вызовов раннера
+// Кнопка — тег в markdown: порядок тегов и есть прежний порядок кнопок.
+const buttonsOf = (text: string): Array<[string, string]> =>
+  [
+    ...text.matchAll(
+      /<tg-button[^>]*data="([^"]+)"[^>]*>([^<]*)<\/tg-button>/g,
+    ),
+  ].map((match) => [match[2], match[1]] as [string, string]);
+
+// Стенд как в menu-screens.test.ts: экран отдаёт готовый markdown движку (flows.screen),
+// а движок в тестах — накопитель рендеров.
 function makeCtx({
   lang = "ru",
   deps = {},
 }: { lang?: string; deps?: TestDeps } = {}): Harness {
   const rendered: MenuServiceView[] = [];
-  const tgCalls: TelegramCall[] = [];
   let state: TestState | null = null;
   const flows = {
-    screen: async (
-      st: MenuServiceState,
-      text: string,
-      rows: MenuServiceView["rows"],
-    ) => {
+    screen: async (st: MenuServiceState, text: string) => {
       const testState = st as TestState;
       testState.msgId ??= 1;
-      testState._last = { text, rows };
-      rendered.push({ text, rows });
+      testState._last = { text };
+      rendered.push({ text });
     },
     get: () => state,
     touch: () => {},
   };
   const ctx: MenuServiceContext = {
-    tg: async (method, body) => {
-      tgCalls.push({ method, body });
-      return { ok: true, result: {} };
-    },
     deps: { root: "", envPath: "", dataDir: "", ...deps },
     flows,
     tr: (en: string, ru: string) => (lang === "ru" ? ru : en),
-    btn: (text: string, data: string) => ({ text, callback_data: data }),
-    backRow: () => [{ text: "‹ Назад", callback_data: "iva_menu:r:o" }],
     show: async (st: MenuServiceState, sid: string) => {
       st.screen = sid;
       const v = await service.render(st, ctx);
-      await flows.screen(st, v.text, v.rows);
+      await flows.screen(st, v.text);
     },
   };
   return {
     ctx,
     rendered,
-    tgCalls,
     get st() {
       return state;
     },
@@ -133,16 +128,14 @@ const fastRun = {
   pollMs: 5,
 } satisfies Partial<RunOptions>;
 
-test("svc зарегистрирован в движке, root ведёт на него, Закрыть в своём ряду", () => {
+test("svc зарегистрирован в движке, root ведёт на него, Закрыть в конце", () => {
   assert.equal(SCREENS.svc, service);
   const view = root.render(newState({ screen: "r" }), makeCtx().ctx);
-  const flat = view.rows.flat();
-  assert.ok(flat.some((b) => b.callback_data === "iva_menu:svc:o"));
-  const closeRow = view.rows.find((r) =>
-    r.some((b) => b.callback_data === "iva_menu:r:x"),
-  );
-  assert.ok(closeRow);
-  assert.equal(closeRow.length, 1);
+  const buttons = buttonsOf(view.text);
+  assert.ok(buttons.some(([, data]) => data === "iva_menu:svc:o"));
+  const close = buttons.filter(([, data]) => data === "iva_menu:r:x");
+  assert.equal(close.length, 1);
+  assert.deepEqual(buttons.at(-1), ["✖ Закрыть", "iva_menu:r:x"]);
 });
 
 test("render idle: четыре команды и Назад, ru/en", async () => {
@@ -152,7 +145,7 @@ test("render idle: четыре команды и Назад, ru/en", async () =
     const st = newState();
     h.st = st;
     const view = await service.render(st, h.ctx);
-    const data = view.rows.flat().map((b) => b.callback_data);
+    const data = buttonsOf(view.text).map(([, callback]) => callback);
     for (const cb of [
       "iva_menu:svc:c:doc",
       "iva_menu:svc:c:cln",
@@ -179,10 +172,9 @@ test("render snapshots the current run before returning its promise", async (t) 
     "doc",
     { argv: [process.execPath, "-e", "setTimeout(() => {}, 2000)"] },
     {
-      tg: h.ctx.tg,
+      edit: () => Promise.resolve(),
       chatId: st.chatId,
       messageId: st.msgId,
-      loader: LOADERS.doc,
       progressView: () => ({ text: "running" }),
       ...fastRun,
     },
@@ -202,7 +194,7 @@ test("подтверждение: c:<cmd> рисует описание и ▶ g
   for (const cmd of ["doc", "cln", "mem"]) {
     await service.on("c", [cmd], st, h.ctx);
     assert.ok(st._last);
-    const data = st._last.rows.flat().map((b) => b.callback_data);
+    const data = buttonsOf(st._last.text).map(([, callback]) => callback);
     assert.ok(data.includes(`iva_menu:svc:go:${cmd}`));
     assert.ok(data.includes("iva_menu:svc:o")); // Назад к списку
   }
@@ -224,10 +216,7 @@ test("up: хендофф в deps.handleUpdateCheck с chatId", async () => {
   assert.equal(called, 10);
 });
 
-// Регрессия 0.3.2: кнопка спавнила cleanup.py по пути ВНУТРИ vault'а, куда его клал синк.
-// Юзеры с 0.3.0 прыжком на 0.3.2 получали «Failed to spawn … (os error 2)». Скрипт обязан
-// браться из репо и реально существовать, а vault остаётся только рабочим каталогом.
-test("cln: cleanup.py берётся из репо, cwd — vault", async () => {
+test("cln: TypeScript cleaner берётся из репо, cwd — vault", async () => {
   const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "../../..");
   const dataDir = mkdtempSync(join(tmpdir(), "iva-data-"));
   const h = makeCtx({
@@ -235,10 +224,13 @@ test("cln: cleanup.py берётся из репо, cwd — vault", async () => 
   });
   const spec = await commandSpec("cln", h.ctx);
   assert.equal(spec.kind, "proc");
-  assert.deepEqual(spec.argv.slice(0, 2), ["uv", "run"]);
-  assert.equal(spec.argv[2], join(repoRoot, "scripts/autograph/cleanup.py"));
-  assert.ok(existsSync(spec.argv[2]), `нет скрипта: ${spec.argv[2]}`);
-  assert.deepEqual(spec.argv.slice(3), [".", "--apply"]);
+  assert.deepEqual(spec.argv.slice(0, 2), [
+    process.execPath,
+    join(repoRoot, "scripts/vault-cleanup.ts"),
+  ]);
+  assert.ok(existsSync(spec.argv[1]), `нет скрипта: ${spec.argv[1]}`);
+  assert.deepEqual(spec.argv.slice(2), [".", "--apply"]);
+  assert.equal(spec.argv.length, 4);
   assert.equal(spec.cwd, join(repoRoot, "vault"));
 });
 
@@ -250,7 +242,7 @@ test("doc: doctor receives the menu's canonical data directory", async () => {
   assert.equal(spec.env?.ASSISTANT_DATA_DIR, dataDir);
 });
 
-test("go:doc: прогресс с 🔄-entity, финал ✅ с кнопкой Назад", async () => {
+test("go:doc: прогресс с 🔄, финал ✅ с кнопкой Назад", async () => {
   resetForTests();
   const dataDir = mkdtempSync(join(tmpdir(), "iva-data-"));
   const h = makeCtx({
@@ -269,16 +261,14 @@ test("go:doc: прогресс с 🔄-entity, финал ✅ с кнопкой 
   h.st = st;
   await service.on("go", ["doc"], st, h.ctx);
   await waitFor(() => currentRun()?.status === "done");
-  await waitFor(() => h.tgCalls.some((c) => /✅/.test(c.body.text || "")));
-  const rich = h.tgCalls.find((c) => c.body.entities);
-  assert.ok(rich);
-  assert.ok(rich.body.entities);
-  assert.equal(rich.body.entities[0].custom_emoji_id, LOADERS.doc.id);
-  const final = h.tgCalls.filter((c) => /✅/.test(c.body.text || "")).at(-1);
+  await waitFor(() => h.rendered.some((v) => /✅/.test(v.text)));
+  assert.ok(h.rendered.some((v) => v.text.startsWith(LOADERS.doc.alt)));
+  const final = h.rendered.filter((v) => /✅/.test(v.text)).at(-1);
   assert.ok(final);
-  assert.ok(final.body.text);
-  assert.match(final.body.text, /Диагностика пройдена/);
-  assert.ok(JSON.stringify(final.body.reply_markup).includes("iva_menu:svc:o"));
+  assert.match(final.text, /Диагностика пройдена/);
+  assert.ok(
+    buttonsOf(final.text).some(([, data]) => data === "iva_menu:svc:o"),
+  );
 });
 
 test("go:cln: сводка парсит финальную строку cleanup", async () => {
@@ -290,7 +280,7 @@ test("go:cln: сводка парсит финальную строку cleanup"
       root: "/nonexistent",
       envPath: join(dataDir, ".env"),
       svcRun: fastRun,
-      // Строка ДОСЛОВНО как её печатает scripts/autograph/cleanup.py (режим — applied).
+      // Строка дословно как её печатает scripts/vault-cleanup.ts.
       svcSpec: () => ({
         kind: "proc",
         argv: [
@@ -305,15 +295,74 @@ test("go:cln: сводка парсит финальную строку cleanup"
   h.st = st;
   await service.on("go", ["cln"], st, h.ctx);
   await waitFor(() =>
-    h.tgCalls.some(
-      (c) => /Чистка/.test(c.body.text || "") && /✅/.test(c.body.text || ""),
-    ),
+    h.rendered.some((v) => /Чистка/.test(v.text) && /✅/.test(v.text)),
   );
-  const final = h.tgCalls.filter((c) => /✅/.test(c.body.text || "")).at(-1);
+  const final = h.rendered.filter((v) => /✅/.test(v.text)).at(-1);
   assert.ok(final);
-  assert.ok(final.body.text);
-  assert.match(final.body.text, /3 файл/);
-  assert.match(final.body.text, /224(\.0)? МБ/);
+  assert.match(final.text, /3 файл/);
+  assert.match(final.text, /224(\.0)? МБ/);
+});
+
+// Чистка идёт процессом, пока мост свободен: правки владельца в Obsidian ложатся в vault
+// рядом с её работой, и без пары коммитов они уехали бы в ночной `add -A` неотличимо от
+// результата чистки. Шов тот же, что у обновлятора: снимок «до» и результат после.
+test("go:cln: чистка оставляет в vault пару коммитов — снимок до и результат", async (t) => {
+  resetForTests();
+  t.after(() => {
+    cancelRun();
+    resetForTests();
+  });
+  const vault = mkdtempSync(join(tmpdir(), "iva-vault-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-c", "core.quotePath=false", ...args], {
+      cwd: vault,
+      encoding: "utf8",
+    }).trim();
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "vault@example.com");
+  git("config", "user.name", "Vault");
+  writeFileSync(join(vault, "CORE.md"), "# CORE\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "vault");
+  // Правка владельца в Obsidian, ещё не в истории: она уезжает в снимок «до».
+  writeFileSync(join(vault, "CORE.md"), "# CORE\n\nправка владельца\n");
+
+  const dataDir = mkdtempSync(join(tmpdir(), "iva-data-"));
+  const h = makeCtx({
+    deps: {
+      dataDir,
+      root: "/nonexistent",
+      envPath: join(dataDir, ".env"),
+      svcRun: fastRun,
+      // Чистка — чужой процесс: правит vault мимо инструментов памяти. cwd процесса и есть
+      // vault, поэтому коммиты ложатся в него.
+      svcSpec: () => ({
+        kind: "proc",
+        cwd: vault,
+        argv: [
+          process.execPath,
+          "-e",
+          "require('node:fs').writeFileSync('карточка.md', '# Починено\\n')",
+        ],
+      }),
+    },
+  });
+  const st = newState();
+  h.st = st;
+  await service.on("go", ["cln"], st, h.ctx);
+  await waitFor(() => currentRun()?.status === "done");
+  await waitFor(() => git("log", "--pretty=%s").split("\n").length >= 3);
+  assert.deepEqual(git("log", "--pretty=%s").split("\n").slice(0, 2), [
+    "menu: vault cleanup",
+    "menu: vault snapshot",
+  ]);
+  // Снимок «до» держит правку владельца, второй коммит - результат чистки.
+  assert.match(git("show", "--name-only", "--pretty=", "HEAD~1"), /CORE\.md/u);
+  assert.match(
+    git("show", "--name-only", "--pretty=", "HEAD"),
+    /карточка\.md/u,
+  );
+  assert.equal(git("status", "--porcelain"), "");
 });
 
 test("go:mem: юнит через systemctl, финал «Цикл памяти пройден»", async () => {
@@ -345,7 +394,7 @@ test("go:mem: юнит через systemctl, финал «Цикл памяти 
   h.st = st;
   await service.on("go", ["mem"], st, h.ctx);
   await waitFor(() =>
-    h.tgCalls.some((c) => /Цикл памяти пройден/.test(c.body.text || "")),
+    h.rendered.some((v) => /Цикл памяти пройден/.test(v.text)),
   );
 });
 
@@ -376,16 +425,14 @@ test("busy-гейт: второй go при running — экран «Уже ид
   // отмена через ab
   await service.on("ab", [], st, h.ctx);
   await waitFor(() => currentRun()?.status === "cancelled");
-  await waitFor(() =>
-    h.tgCalls.some((c) => /Прервано/.test(c.body.text || "")),
-  );
+  await waitFor(() => h.rendered.some((v) => /Прервано/.test(v.text)));
 });
 
 test("update-lock: занят — go:doc не стартует, текст про обновление", async () => {
   resetForTests();
   const dataDir = mkdtempSync(join(tmpdir(), "iva-data-"));
-  const lock = acquireUpdateLock(dataDir, "test-hold");
-  assert.ok(lock.ok);
+  const lock = acquireUpdateLock(dataDir);
+  assert.ok(lock);
   const h = makeCtx({
     deps: {
       dataDir,
@@ -401,7 +448,39 @@ test("update-lock: занят — go:doc не стартует, текст пр�
   assert.equal(currentRun(), null);
   assert.ok(st._last);
   assert.match(st._last.text, /обновлени/i);
-  releaseUpdateLock(lock);
+  lock.release();
+});
+
+// Обратная сторона того же гейта: обновление, убитое вместе с процессом, оставляет
+// каталог лока навсегда, и меню, которое смотрит на существование каталога, после
+// одного такого падения молчит про обновление до конца жизни установки.
+test("update-lock: владелец лока мёртв — go:doc стартует", async () => {
+  resetForTests();
+  const dataDir = mkdtempSync(join(tmpdir(), "iva-data-"));
+  const dead = spawnSync(process.execPath, ["-e", "0"]).pid;
+  assert.ok(dead);
+  mkdirSync(join(dataDir, "update.lock"), { recursive: true });
+  writeFileSync(
+    join(dataDir, "update.lock/owner.json"),
+    JSON.stringify({ pid: dead, startedAt: new Date().toISOString() }),
+  );
+  const h = makeCtx({
+    deps: {
+      dataDir,
+      root: "/x",
+      envPath: join(dataDir, ".env"),
+      svcRun: fastRun,
+      svcSpec: () => ({ kind: "proc", argv: [process.execPath, "-e", "0"] }),
+    },
+  });
+  const st = newState();
+  h.st = st;
+
+  await service.on("go", ["doc"], st, h.ctx);
+
+  assert.notEqual(currentRun(), null);
+  assert.ok(st._last);
+  assert.doesNotMatch(st._last.text, /обновлени/i);
 });
 
 const PLANTED = `api_key=${"z".repeat(24)}`;
@@ -423,8 +502,8 @@ function gatedStand(
   const originalFetch = globalThis.fetch;
   const originalError = console.error;
   globalThis.fetch = (async (_url: string, init: { body: string }) => {
-    const { text } = JSON.parse(init.body) as { text?: string };
-    sent.push(text ?? "");
+    const body = JSON.parse(init.body) as TelegramBody;
+    sent.push(body.rich_message?.markdown ?? body.text ?? "");
     return { json: async () => ({ ok: true, result: { message_id: 1 } }) };
   }) as unknown as typeof fetch;
   console.error = () => {}; // «[security] outbound leak redacted» на каждый тик
@@ -441,7 +520,6 @@ function gatedStand(
     msgId: 1,
   }) as unknown as MenuServiceState;
   const ctx: MenuServiceContext = {
-    tg: bridgeTg as MenuServiceContext["tg"],
     deps: {
       root: "/x",
       dataDir,
@@ -451,12 +529,10 @@ function gatedStand(
     },
     flows: flows as unknown as MenuServiceContext["flows"],
     tr: (_en: string, ru: string) => ru,
-    btn: (text: string, data: string) => ({ text, callback_data: data }),
-    backRow: () => [{ text: "‹ Назад", callback_data: "iva_menu:r:o" }],
     show: async (state: MenuServiceState, sid: string) => {
       state.screen = sid;
       const v = await service.render(state, ctx);
-      await ctx.flows.screen(state, v.text, v.rows);
+      await ctx.flows.screen(state, v.text);
     },
   };
   return { ctx, st, sent };

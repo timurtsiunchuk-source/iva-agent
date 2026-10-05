@@ -33,7 +33,7 @@ import {
 type UpdateOfferRequest = {
   token: string;
   chatId: string;
-  offer: { text: string; replyMarkup: { inline_keyboard: unknown[][] } };
+  offer: { text: string };
 };
 type DailyUpdateResult = {
   status: string;
@@ -62,6 +62,11 @@ const { runDailyUpdateCheck } = require("../check-update.mjs") as unknown as {
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 
+/** callback_data кнопок в порядке появления в rich-тексте сообщения. */
+function actionCallbacks(text: string): string[] {
+  return [...text.matchAll(/data="([^"]+)"/gu)].map((match) => match[1]);
+}
+
 function repoFixture() {
   const temp = mkdtempSync(join(tmpdir(), "iva-update-check-"));
   const remote = join(temp, "remote.git");
@@ -80,9 +85,28 @@ function repoFixture() {
   git(temp, "init", "--bare", remote);
   git(seed, "remote", "add", "origin", remote);
   git(seed, "push", "-u", "origin", "main");
+  // Бета — ветка beta (ADR-0018): каждый push seed кладёт ту же историю и в неё.
+  git(
+    seed,
+    "config",
+    "--add",
+    "remote.origin.push",
+    "refs/heads/main:refs/heads/main",
+  );
+  git(
+    seed,
+    "config",
+    "--add",
+    "remote.origin.push",
+    "refs/heads/main:refs/heads/beta",
+  );
+  git(seed, "push");
   git(temp, "clone", "--branch", "main", remote, local);
   git(local, "config", "user.email", "test@example.com");
   git(local, "config", "user.name", "Test");
+  // Эти проверки — о вершине ветки: бета-обновления (иначе обновление ждёт выпуск,
+  // метку vX.Y.Z — update-release-git.test.ts). Прежний флаг при main уводит на beta.
+  git(local, "config", "iva.beta", "true");
   return { temp, remote, seed, local };
 }
 
@@ -150,11 +174,11 @@ test("a merged legacy feature branch discovers updates from main", async () => {
   );
   git(seed, "add", "package.json");
   git(seed, "commit", "-m", "release");
-  git(seed, "push", "origin", "main");
+  git(seed, "push");
 
   const info = await inspectUpstream({ root: local });
   assert.equal(info.currentBranch, "feat/legacy");
-  assert.equal(info.branch, "main");
+  assert.equal(info.branch, "beta");
   assert.equal(info.legacyMigration, true);
   assert.equal(info.remote, git(seed, "rev-parse", "HEAD"));
   assert.equal(info.hasVersionUpdate, true);
@@ -199,7 +223,7 @@ test("notification target prefers digest chat and falls back to the first truste
   assert.equal(notificationChat({}), "");
 });
 
-test("installer persists the selected update channel and integrates the fetched oid", () => {
+test("installer persists the selected update channel", () => {
   const installer = readFileSync(
     new URL("../../install.sh", import.meta.url),
     "utf8",
@@ -212,11 +236,6 @@ test("installer persists the selected update channel and integrates the fetched 
     installer,
     /UPDATE_CHANNEL="\$\(git -C "\$PROJECT_DIR" branch --show-current/,
   );
-  assert.match(
-    installer,
-    /remote_ref="\$\(git -C "\$PROJECT_DIR" rev-parse FETCH_HEAD\)"/,
-  );
-  assert.doesNotMatch(installer, /remote_ref="origin\/\$BRANCH"/);
 });
 
 test("notification state is atomic, private and readable", async () => {
@@ -248,7 +267,11 @@ test("daily check sends one offer per version and records only successful sends"
   };
   assert.equal((await runDailyUpdateCheck(options)).status, "notified");
   assert.equal(sent.length, 1);
-  assert.equal(sent[0].offer.replyMarkup.inline_keyboard[0].length, 2);
+  // Кнопки — строки rich-текста: обе на месте, рядом со своими пояснениями.
+  assert.deepEqual(actionCallbacks(sent[0].offer.text), [
+    "iva_update:do",
+    "iva_update:skip",
+  ]);
   assert.match(sent[0].offer.text, /Доступна новая версия Ивы/);
   assert.equal((await runDailyUpdateCheck(options)).status, "already-notified");
   assert.equal(sent.length, 1);
@@ -319,11 +342,12 @@ test("the daily notice says what is new, in the language of the notice", async (
     sent[0].offer.text,
     /• 🔁 Reply на старое сообщение больше не вешает бота\n/,
   );
+  // What's New sits between the body and the buttons; the buttons close the message.
   assert.match(
     sent[0].offer.text,
-    /Полный список: https:\/\/github\.com\/smixs\/iva-agent\/releases$/,
+    /Полный список: https:\/\/github\.com\/smixs\/iva-agent\/releases\n\n<tg-button [^]*iva_update:skip[^]*<\/tg-button> — напомню завтра$/,
   );
-  // Sent without parse_mode: no markdown marker may reach the chat.
+  // Rich markdown: no stray markdown marker may reach the chat.
   assert.doesNotMatch(sent[0].offer.text, /[`*]/);
 });
 
@@ -395,10 +419,10 @@ test("offer copy is bilingual and keeps existing callback actions", () => {
   const ru = updateOffer("1.2.3", "1.2.4", "ru");
   assert.match(en.text, /new Iva version/);
   assert.match(ru.text, /новая версия Ивы/);
-  assert.deepEqual(
-    en.replyMarkup.inline_keyboard[0].map((button) => button.callback_data),
-    ["iva_update:do", "iva_update:skip"],
-  );
+  assert.deepEqual(actionCallbacks(en.text), [
+    "iva_update:do",
+    "iva_update:skip",
+  ]);
 });
 
 test("systemd templates schedule a persistent 10:00 local check and lifecycle commands include it", () => {
@@ -423,10 +447,6 @@ test("systemd templates schedule a persistent 10:00 local check and lifecycle co
     join(root, "scripts", "cli", "systemd.ts"),
     "utf8",
   );
-  const cliUpdate = readFileSync(
-    join(root, "scripts", "cli", "update.ts"),
-    "utf8",
-  );
   const installer = readFileSync(join(root, "install.sh"), "utf8");
   assert.match(timer, /OnCalendar=\*-\*-\* 10:00:00 __TIMEZONE__/);
   assert.match(timer, /Persistent=true/);
@@ -434,32 +454,10 @@ test("systemd templates schedule a persistent 10:00 local check and lifecycle co
   assert.match(service, /EnvironmentFile=__PROJECT_DIR__\/\.env/);
   assert.match(cliRuntime, /const TIMERS = \[BRAIN_TIMER, UPDATE_TIMER\]/);
   assert.match(cliSystemd, /replaceAll\("__TIMEZONE__", timezone\)/);
-  assert.match(cliUpdate, /systemd\.activate\(\[UPDATE_TIMER\]\)/);
   assert.match(installer, /bin\/iva\.mjs" _activate-units/);
   assert.match(
     pollService,
     /ExecStartPost=-\/usr\/bin\/systemctl --user enable --now iva-update-check\.timer/,
-  );
-});
-
-test("a post-commit timer failure exits without rollback or a false update claim", () => {
-  const cliUpdate = readFileSync(
-    new URL("../cli/update.ts", import.meta.url),
-    "utf8",
-  );
-
-  assert.match(
-    cliUpdate,
-    /Iva is ready, but the automatic update timer could not be activated/,
-  );
-  assert.doesNotMatch(cliUpdate, /timerFailure: "Iva updated/);
-  assert.match(
-    cliUpdate,
-    /const finalizeUpdate = async \(\): Promise<boolean> => \{[\s\S]*?commitThenRunPostCommit[\s\S]*?terminal\.fail\(text\.timerFailure\)[\s\S]*?process\.exitCode = 1;[\s\S]*?return false;/,
-  );
-  assert.equal(
-    cliUpdate.match(/if \(!\(await finalizeUpdate\(\)\)\) return;/g)?.length,
-    2,
   );
 });
 
@@ -728,6 +726,16 @@ test("the marker of a fetched tree decides whether this updater may install it",
     assert.deepEqual(await updaterCompat(at(local), marked, own), {
       status: "ok",
     });
+  // Бета-обновлятор — чуть младше своего релиза: 0.4.11-beta.1 < 0.4.11, но > 0.3.29.
+  for (const own of ["0.3.30-beta.1", "0.4.11-beta.1"])
+    assert.deepEqual(await updaterCompat(at(local), marked, own), {
+      status: "ok",
+    });
+  assert.deepEqual(await updaterCompat(at(local), marked, "0.3.29-beta.1"), {
+    status: "too-old",
+    own: "0.3.29-beta.1",
+    minUpdater: "0.3.29",
+  });
 
   writeFileSync(join(seed, "update-compat.json"), "{ not json\n");
   git(seed, "add", "update-compat.json");
@@ -743,7 +751,11 @@ test("the marker of a fetched tree decides whether this updater may install it",
 
 test("this checkout names its own release, and the refusal says how to repair it", () => {
   const own = updaterVersion();
-  assert.match(own, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+  // Релиз X.Y.Z или бета X.Y.Z-beta.N (бета-обновления, 0.4.11-beta.1).
+  assert.match(
+    own,
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/,
+  );
   assert.throws(
     () => updaterVersion(mkdtempSync(join(tmpdir(), "iva-no-package-"))),
     /no readable release/,
@@ -764,19 +776,17 @@ test("this checkout names its own release, and the refusal says how to repair it
 test("the update Alert carries the repair command only for an updater that is too old", async () => {
   const plain = updateOffer("1.2.3", "1.2.4", "en");
   assert.doesNotMatch(plain.text, /repair\.sh/);
-  assert.match(plain.text, /Settings and local changes will be preserved\./);
+  assert.match(plain.text, /Edits to Iva's own code are not carried over\./u);
 
   for (const locale of ["en", "ru"]) {
     const stuck = updateOffer("1.2.3", "1.2.4", locale, true);
     assert.match(stuck.text, /v1\.2\.3 → v1\.2\.4/);
     assert.ok(stuck.text.includes(REPAIR_COMMAND), stuck.text);
     // The buttons stay: the tap now earns the same words instead of a broken update.
-    assert.deepEqual(
-      stuck.replyMarkup.inline_keyboard[0].map(
-        (button) => button.callback_data,
-      ),
-      ["iva_update:do", "iva_update:skip"],
-    );
+    assert.deepEqual(actionCallbacks(stuck.text), [
+      "iva_update:do",
+      "iva_update:skip",
+    ]);
   }
 
   // End to end: the flag comes off the remote marker the daily check already fetched.
@@ -803,4 +813,144 @@ test("the update Alert carries the repair command only for an updater that is to
       info.updaterTooOld,
     ).text.includes(REPAIR_COMMAND),
   );
+});
+
+test("beta: Alert о новых коммитах ветки — версия и заголовки Unreleased (≤ 5), тот же коммит второй раз не шлётся", async () => {
+  const { temp, seed, local } = repoFixture();
+  const rows = Array.from(
+    { length: 6 },
+    (_, i) => `- 🔧 **Правка ${i + 1}**: подробности ${i + 1}.`,
+  );
+  writeFileSync(
+    join(seed, "CHANGELOG.md"),
+    `# Changelog\n\n## [Unreleased]\n\n${rows.join("\n")}\n\n## [1.2.3] - 2026-01-01\n\n- 🐞 **Старое**: было.\n`,
+  );
+  writeFileSync(
+    join(seed, "package.json"),
+    '{"name":"iva","version":"1.2.4-beta.1"}\n',
+  );
+  git(seed, "add", "-A");
+  git(seed, "commit", "-m", "beta build");
+  git(seed, "push");
+  const sent: string[] = [];
+  const env = {
+    TELEGRAM_BOT_TOKEN: "t",
+    TELEGRAM_DIGEST_CHAT_ID: "1",
+    AGENT_LANGUAGE: "ru",
+    ASSISTANT_DATA_DIR: join(temp, "data"),
+  };
+  const check = () =>
+    runDailyUpdateCheck({
+      root: local,
+      env,
+      sendImpl: async ({ offer }) => void sent.push(offer.text),
+    });
+  assert.equal((await check()).status, "notified");
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /1\.2\.4-beta\.1/u);
+  for (const n of [1, 2, 3, 4, 5])
+    assert.match(sent[0], new RegExp(`Правка ${n}\\b`, "u"));
+  assert.doesNotMatch(sent[0], /Правка 6|Старое|подробности/u);
+  assert.equal((await check()).status, "already-notified");
+  writeFileSync(join(seed, "more.txt"), "x\n");
+  git(seed, "add", "-A");
+  git(seed, "commit", "-m", "another");
+  git(seed, "push");
+  assert.equal((await check()).status, "notified");
+  assert.equal(sent.length, 2);
+});
+
+test("beta: сборка требует обновлятор новее установленного — в Alert инструкция ремонта вместо кнопки", async () => {
+  const { temp, seed, local } = repoFixture();
+  writeFileSync(join(seed, "update-compat.json"), '{"minUpdater":"99.0.0"}\n');
+  git(seed, "add", "-A");
+  git(seed, "commit", "-m", "needs a newer updater");
+  git(seed, "push");
+  const sent: string[] = [];
+  const result = await runDailyUpdateCheck({
+    root: local,
+    env: {
+      TELEGRAM_BOT_TOKEN: "t",
+      TELEGRAM_DIGEST_CHAT_ID: "1",
+      AGENT_LANGUAGE: "en",
+      ASSISTANT_DATA_DIR: join(temp, "data"),
+    },
+    sendImpl: async ({ offer }) => void sent.push(offer.text),
+  });
+  assert.equal(result.status, "notified");
+  assert.ok(sent[0]?.includes(REPAIR_COMMAND), sent[0]);
+  assert.deepEqual(actionCallbacks(sent[0] ?? ""), []);
+});
+
+// Круг 2 (QA D3): бета включена, ветка beta недоступна (нет сети или ветки) — ежедневная
+// проверка молчит, как «current»; отказ скажет сам iva update. Настоящий git: зеркало с
+// веткой beta в config и origin без ветки beta.
+test("daily check on beta with the beta branch unavailable stays quiet as current", async () => {
+  const { local } = repoFixture();
+  git(local, "config", "iva.updateBranch", "beta");
+  git(local, "remote", "set-url", "origin", join(local, "нет.git"));
+  const result = await runDailyUpdateCheck({
+    root: local,
+    env: { TELEGRAM_BOT_TOKEN: "t", TELEGRAM_DIGEST_CHAT_ID: "1" },
+    sendImpl: async () => assert.fail("nothing to offer"),
+  });
+  assert.equal(result.status, "current");
+});
+
+// ── Круг 3: таблица отказов ежедневной проверки на бете ──────────────────────────────
+// Молчит, как current, только сеть и отсутствующая ветка beta. Повреждённый
+// update-compat.json на вершине и негодное имя ветки показываются, как до беты.
+test("daily failure table: only an unreachable or missing beta branch is quiet", async () => {
+  const rows: Array<
+    [string, (fx: ReturnType<typeof repoFixture>) => void, "current" | "error"]
+  > = [
+    [
+      "network",
+      (fx) =>
+        git(fx.local, "remote", "set-url", "origin", join(fx.local, "нет.git")),
+      "current",
+    ],
+    [
+      "missing branch",
+      (fx) => git(fx.remote, "update-ref", "-d", "refs/heads/beta"),
+      "current",
+    ],
+    [
+      "update-compat.json",
+      (fx) => {
+        writeFileSync(join(fx.seed, "update-compat.json"), "{ not json");
+        git(fx.seed, "add", "update-compat.json");
+        git(fx.seed, "commit", "-m", "broken compat");
+        git(fx.seed, "push");
+      },
+      "error",
+    ],
+    // R4: origin и ветка есть, fetch падает локально — ошибка видна, а не тишина.
+    [
+      "fetch (local)",
+      (fx) =>
+        mkdirSync(join(fx.local, ".git", "FETCH_HEAD"), { recursive: true }),
+      "error",
+    ],
+    [
+      "branch name",
+      (fx) => git(fx.local, "config", "iva.updateBranch", "a..b"),
+      "error",
+    ],
+  ];
+  const broken: string[] = [];
+  for (const [step, inject, expect] of rows) {
+    const fx = repoFixture();
+    inject(fx);
+    const outcome = await runDailyUpdateCheck({
+      root: fx.local,
+      env: { TELEGRAM_BOT_TOKEN: "t", TELEGRAM_DIGEST_CHAT_ID: "1" },
+      sendImpl: async () => {},
+    }).then(
+      (result) => result.status,
+      () => "error",
+    );
+    if (outcome !== expect) broken.push(`${step}: ${outcome}`);
+  }
+  assert.deepEqual(broken, []);
 });

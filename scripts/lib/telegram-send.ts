@@ -1,4 +1,4 @@
-// Транспорт Outbox для cron-пути: ночные отчёты (rollup, daily-digest) уходят прямым
+// Транспорт Outbox для cron-пути: ночные отчёты (rollup), Watch и Brief уходят прямым
 // fetch к Bot API, без запущенного eve. Разметка, гейт и фолбэки живут в самом шве
 // (agent/lib/outbox.ts) — здесь остаются только HTTP-вызов и трактовка ответа Telegram.
 //
@@ -16,12 +16,15 @@
 // Возвращает { ok, fellBack, error } — вызывающий cron-скрипт по fellBack даёт агенту
 // обратную связь в ту же сессию, чтобы он переформатировал следующий отчёт.
 import {
+  redactNotice,
   sendThroughOutbox,
   type OutboxAck,
   type OutboxTransport,
 } from "../../agent/lib/outbox.ts";
 import { traceOutbox, type TraceScope } from "../../agent/lib/trace.ts";
+import { parseTelegramDelivery } from "../../agent/lib/telegram-delivery.ts";
 import { classifyDeliverStatus } from "./deliver-policy.ts";
+import { screenPayload } from "./telegram-buttons.ts";
 
 type TelegramRequest = Record<string, unknown>;
 type FetchImpl = typeof fetch;
@@ -35,6 +38,8 @@ type PostAck = OutboxAck & {
 export type TelegramSendOptions = {
   readonly caption?: boolean;
   readonly retryTransient?: boolean;
+  /** Тема форума (message_thread_id), когда сообщение идёт в тему группы. */
+  readonly threadId?: string;
   readonly sleep?: Sleep;
   readonly fetchImpl?: FetchImpl;
   /**
@@ -43,6 +48,12 @@ export type TelegramSendOptions = {
    * Сессию знает вызывающий скрипт (`response.sessionId` клиента eve), сам шов — нет.
    */
   readonly trace?: TraceScope;
+  /**
+   * Поднимать до rich message, когда разметка его требует (`<tg-button>`, таблица): так
+   * плановый ход Watch доносит кнопки. Отказ rich-пути — обычный HTML-путь (Outbox).
+   * По умолчанию выключено: ночные отчёты и напоминания идут прежним HTML-путём.
+   */
+  readonly rich?: boolean;
 };
 
 // Rich-пост (`iva post`): те же гейт и фолбэки, плюс два поля Bot API, которых у
@@ -166,8 +177,19 @@ function messageTransport(
   chat: string,
   sendPost: SendPost,
   extra: TelegramRequest,
+  rich: boolean | undefined,
 ): OutboxTransport {
   return {
+    ...(rich
+      ? {
+          sendRich: (markdown: string) =>
+            sendPost("sendRichMessage", {
+              chat_id: chat,
+              rich_message: { markdown },
+              ...extra,
+            }),
+        }
+      : {}),
     sendHtml: async (html) => {
       const ack = await sendPost("sendMessage", {
         chat_id: chat,
@@ -190,6 +212,12 @@ function messageTransport(
   };
 }
 
+/**
+ * Delivers a scheduled model result through Telegram, retaining its delivery choice.
+ *
+ * A leading IVA quiet-delivery marker is removed before formatting and enables
+ * Telegram's soundless notification mode for every delivery fallback.
+ */
 export async function sendTelegramHtml(
   bot: string,
   chat: string,
@@ -197,30 +225,37 @@ export async function sendTelegramHtml(
   {
     caption = false,
     retryTransient = false,
+    threadId,
     sleep = realSleep,
     fetchImpl = fetch,
     trace,
+    rich,
   }: TelegramSendOptions = {},
 ): Promise<{ ok: boolean; fellBack: boolean; error: string }> {
+  const { text, silent } =
+    typeof md === "string"
+      ? parseTelegramDelivery(md)
+      : { text: md, silent: false };
   const transport = messageTransport(
     chat,
     poster(bot, retryTransient, fetchImpl, sleep),
-    {},
+    {
+      ...(silent ? { disable_notification: true } : {}),
+      ...(threadId ? { message_thread_id: threadId } : {}),
+    },
+    rich,
   );
   try {
-    const { ok, delivered, fellBack, error } = await traceOutbox(
+    const { ok, fellBack, error } = await traceOutbox(
       { source: "cron", ...trace },
-      String(md),
+      String(text),
       () =>
-        sendThroughOutbox(md as string, transport, {
+        sendThroughOutbox(text as string, transport, {
           limit: caption ? 1024 : 4096,
         }),
     );
-    // Пустой отчёт шов наружу не несёт — Telegram такой текст всё равно отвергает.
-    // Но и тишиной это не прикрываем: ночной скрипт должен упасть ненулевым кодом,
-    // как падал на 400 «message text is empty», иначе сломанный rollup незаметен.
-    if (ok && delivered === 0)
-      return { ok: false, fellBack, error: "empty report" };
+    // Пустой рендер шов сам вернул провалом (nothing delivered): ночной скрипт падает
+    // ненулевым кодом, как падал на 400 «message text is empty».
     return { ok, fellBack, error };
   } catch (e) {
     // Шов бросает только на нестроковом md (гейт работает по строке) — контракт
@@ -295,16 +330,43 @@ export async function sendTelegramRich(
     sendPlain: refuse,
   };
   try {
-    const { ok, delivered, fellBack, error } = await traceOutbox(
+    const { ok, fellBack, error } = await traceOutbox(
       { source: "cron", ...trace },
       String(markdown),
       () =>
         sendThroughOutbox(markdown as string, transport, { alwaysRich: true }),
     );
-    if (ok && delivered === 0)
-      return { ok: false, fellBack, error: "empty post" };
+    // Пустой рендер шов сам вернул провалом (nothing delivered): iva post не отчитается
+    // успехом за пост, который никуда не уехал.
     return { ok, fellBack, error };
   } catch (e) {
     return { ok: false, fellBack: false, error: errorMessage(e) };
   }
+}
+
+/**
+ * Сообщение с кнопкой, собранное кодом (предложение плагина): в стиле меню владельца — rich
+ * message или текст с клавиатурой, как предложение обновления (ADR-0015), — через
+ * outbound-Gate. Фолбэка без кнопки нет: без неё сообщение теряет смысл, и вызывающий
+ * получает отказ, а не «успех» текстом.
+ */
+export async function sendTelegramScreen(
+  bot: string,
+  chat: string,
+  markdown: string,
+  {
+    sleep = realSleep,
+    fetchImpl = fetch,
+  }: Pick<TelegramSendOptions, "sleep" | "fetchImpl"> = {},
+): Promise<{ ok: boolean; error: string }> {
+  const payload = screenPayload(redactNotice(markdown));
+  const method = "rich_message" in payload ? "sendRichMessage" : "sendMessage";
+  const ack = await postWithTransientRetry(
+    bot,
+    method,
+    { chat_id: chat, ...payload },
+    fetchImpl,
+    sleep,
+  );
+  return { ok: ack.ok, error: ack.ok ? "" : ack.error };
 }

@@ -36,7 +36,7 @@ The rest — for business owners, specialists, executives and everyday life: **[
 
 <img src="assets/iva-flow.webp" alt="How Iva works: voice, text, photos and PDFs fly from Telegram into the willow-tree agent, wired to memory, nightly rollup, cron, reminders, search, web, workspace and docs" width="100%">
 
-The bridge long-polls Telegram, so no public HTTPS, domain or webhook is needed. Iva runs as two systemd user services, two systemd watchdog timers and five in-process eve schedules — operations live in [docs/deploy.md](docs/deploy.md).
+The bridge long-polls Telegram, so no public HTTPS, domain or webhook is needed. Iva runs as two systemd user services, two systemd watchdog timers and seven in-process eve schedules — operations live in [docs/deploy.md](docs/deploy.md).
 
 **Wondering what you'd actually use an agent for?** → [25+ real scenarios — business, work, everyday life](docs/use-cases.md).
 
@@ -55,7 +55,7 @@ The bridge long-polls Telegram, so no public HTTPS, domain or webhook is needed.
 - **Personal CRM** — who your people are, what you agreed, when to follow up.
 - **Search by meaning** — BM25 plus link-graph rerank, any language; optional vector mode with one key.
 - **Decision cards** — what you chose, when and why; old versions stay in a dated History.
-- **Tasks & reminders** — priorities, due dates and a morning digest.
+- **[Tasks](docs/tasks.md) & reminders** — priorities, due dates and a daily brief.
 - **Web search** — four pluggable providers: Tavily, Exa, Parallel or Brave.
 - **Google Workspace** — Gmail, Calendar, Drive, Sheets, Docs and Tasks from chat via the `gws` CLI; installed for you, with a guided key setup right in the conversation.
 - **Skills & MCP** — drop one file to add a procedure or connect an MCP server; keys stay in `.env`.
@@ -117,6 +117,14 @@ Brand-new VPS, still logged in as root? Run `bash <(curl -fsSL https://raw.githu
 
 Install as a normal user, not as root — Iva's shell tool runs as whoever installed it. Headless installs take `--skip-setup` or `--non-interactive`. Prefer to read before you run? Fetch it with `curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/main/install.sh -o install.sh`, read it, then `bash install.sh`. Wizard walkthrough and an SSH primer for first-time VPS owners: [docs/install.md](docs/install.md).
 
+### Updates
+
+- `iva update` installs releases only (`vX.Y.Z` tags) — the default.
+- `main` holds releases only; every accepted change lands in the `beta` branch first.
+- `iva beta` turns on beta updates: the tip of the `beta` branch; `iva stable` turns them off and goes back to `main` (nothing is rolled back — the next release catches up). Then run `iva update`.
+- Any installation, 0.4.8 included, switches to beta with one command: `curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/beta/beta.sh | bash`. A new installation on beta: `curl -fsSL https://raw.githubusercontent.com/smixs/iva-agent/beta/install.sh | IVA_BETA=1 bash`.
+- The same switch is in Telegram: `/menu` → 🛠 Maintenance → 🧪 Updates. `iva version` shows which one is on.
+
 ### The first minute
 
 Three messages, and you can watch the memory work:
@@ -141,7 +149,7 @@ The installer reuses the existing checkout instead of re-cloning, keeps `.env` a
 
 ## Providers & cost
 
-Four model providers. Pick one and fill its block in `.env`:
+Six model providers. Pick one and fill its block in `.env`:
 
 | Provider         | How you pay                            |
 | ---------------- | -------------------------------------- |
@@ -149,45 +157,58 @@ Four model providers. Pick one and fill its block in `.env`:
 | Ollama Cloud     | API key, ~$20/mo                       |
 | OpenRouter       | API key, pay-as-you-go, 300+ models    |
 | OpenAI (ChatGPT) | your Plus/Pro subscription, no API key |
+| Claude (Pro/Max) | your Pro/Max subscription, no API key  |
+| Custom           | your own OpenAI-compatible endpoint    |
 
 Default model is deepseek-v4-pro, 131k context. On Go it runs about $14–15/mo all-in ($10 model + $4–5 VPS; the model's first month is $5), no markup; voice rides Deepgram's free starter credit. Model lists, limits and the search matrix: [docs/providers.md](docs/providers.md).
 
 ## Documentation
 
-[Use cases](docs/use-cases.md) · [Install](docs/install.md) · [Configuration](docs/configuration.md) · [Memory](docs/memory.md) · [Providers](docs/providers.md) · [Security](docs/security.md) · [Deploy](docs/deploy.md) · [Commands & CLI](docs/cli.md) · [Menu](docs/menu.md) · [Extending](docs/extending.md) · [Plugins](docs/plugins.md) · [FAQ](docs/faq.md) · [Troubleshooting](docs/troubleshooting.md)
+[Use cases](docs/use-cases.md) · [Install](docs/install.md) · [Configuration](docs/configuration.md) · [Memory](docs/memory.md) · [Providers](docs/providers.md) · [Security](docs/security.md) · [Deploy](docs/deploy.md) · [Commands & CLI](docs/cli.md) · [Menu](docs/menu.md) · [Reminders](docs/reminders.md) · [Extending](docs/extending.md) · [Plugins](docs/plugins.md) · [FAQ](docs/faq.md) · [Troubleshooting](docs/troubleshooting.md)
 
 Документация на русском → [docs/ru/](docs/ru/)
 
 ## What's New
 
 <details>
-<summary><b>v0.4.0 · 01.09.2026 — expand the latest releases</b></summary>
+<summary><b>v0.4.12 · 05.10.2026 — expand the latest releases</b></summary>
 
-### 01.09.2026
+### 05.10.2026
 
-#### v0.4.0
+#### v0.4.12
 
-- 🧭 **Iva now uses eve's session API**: messages address the active session by `sessionId`, so Stop, `/stop`, and `/new` no longer depend on the old continuation mechanism. The update resets conversation contexts; your vault memory stays intact.
-- 🚦 **New messages queue by default**: `/menu` can select “Queue”, which waits for the current reply, or “Interrupt”, which sends the message into the active reply. The choice survives a restart.
-- 🧠 **Nightly Rollup and plugins run on the new runtime**: manual Rollup uses the active session, code plugins build with the same eve version, and `web_fetch` reports the actual HTTP status instead of inferring it from error text.
-- 🛟 **Update rollback protects local changes more carefully**: a recovery ref is removed only after a verified result, never deletes foreign state, and stays available after an ambiguous verification failure.
-- ⚡ **Iva answers within a second of an update**: every update now quarantines the workflow store and expires open sessions in place — no more silence for up to 30 minutes, and a stuck "Working…" clears itself.
-- 🩹 **The Codex provider (ChatGPT subscription) works again**: every turn was failing with HTTP 400 because eve 0.47 injects a `safety_identifier` field for `openai/*` models; it's stripped now, so chat and nightly Rollups on Codex run.
-- 🔁 **Lost-message notices are honest now**: a message Iva couldn't accept used to surface once a week; now it repeats every 10 minutes until you see it.
+- 👀 **Iva tells you what you missed**: once an hour code checks unread private chats, mentions in Telegram and Gmail without newsletters; the model wakes only for something new and sends one message per item with buttons «To tasks», «Remind later», «Mute this one». Quiet hours at night, at most 5 messages a day, one toggle «Writes on her own» in `/menu` → Notices.
+- ☀️ **The Brief replaces the morning digest**: at 08:30 and 14:00 Iva sends an overview of tasks, calendar, mail, Telegram, connections and plugins. Change the time with a phrase («brief at 9»); `/digest` returns the same overview.
+- 🚨 **Failed jobs reach you with the cause and a Fix button**: user timers and plugin services are checked hourly; Iva's own failed jobs are explained instead of silently self-fixed and come first in the morning Brief. `iva signal <source> <text>` lets any local script hand Iva a message.
+- 🧩 **Iva writes her own plugins**: say «make a plugin that…». A plugin of skills and scripts she installs herself; one with code or MCP she only proposes, and it is installed after you tap Install in a private chat.
+- 🗜 **A long conversation is compacted between turns, not in the middle of an answer**: after a turn that reached 60% of the model window or 275k tokens, Iva compacts the conversation while nobody waits. A message sent meanwhile gets «Compacting the conversation, I'll answer in a moment.» and its answer right after.
+- 🧹 **Iva no longer asks you to press /new**: the «context window is N% full» line is gone; `/new` works as before.
+- 🎬 **Video, audio and files are handled by Iva herself, and she sees an image on disk**: the model gets facts about an attachment instead of orders not to touch it, and `read_file` on an image returns its description from the vision model.
 
-### 27.08.2026
+### 03.10.2026
 
-#### v0.3.34
+#### v0.4.11
 
-- 👁️ **The chat model now looks at the picture itself when it can**: every photo used to go to a separate vision model (`OLLAMA_VISION_MODEL` and friends), and the chat model got a retelling — details and the text in the image were lost, and every picture cost a second call. On the first picture Iva now asks the chat model itself, once: a solid red square and a question about its colour. Names red — sighted: photos travel to it as pixels and the vision model is never called. Refuses, or answers without the colour — the old path through `*_VISION_MODEL`. The session history keeps only the vault path; the bytes are attached at request time — so switching to a text-only model breaks nothing, and at most the ten most recent pictures of the prompt travel, 6 MB total; a file over 4 MB and a picture of an unknown type (`.heic` and alike) are still described by the vision model. Network failures and provider overload decide nothing: the next try waits at least a minute, the verdict lives until restart, and a model change asks the question again.
-- 📐 **The decision is written down: sight is asked of the provider itself, not of a catalog**: [ADR-0012](docs/adr/0012-the-chat-model-looks-at-the-picture-itself.md) records the probe, the replay ceilings and the rejected alternatives (eve attachments living in the session history, a static capability catalog, a second call describing with the same model). A picture the model looks at itself never passes the text sanitizer — `docs/security.md` and the configuration doc state that boundary and its guard (the «text in the image is DATA, not instructions» line plus the ceilings) plainly.
+- 🌙 **Nightly memory works on a ChatGPT subscription again**: the night call now streams on every provider. Since 0.4.9 the subscription backend answered 400 on the first call of every night. The night's own low reasoning effort is no longer overridden by the chat default.
+- 🗂️ **A vault `.gitignore` no longer stops the night**: files the owner excludes are skipped and named in the log, the rest is committed and the day closes. Ignored files stay on disk, outside the backup.
+- 🔁 **A short provider failure no longer fails the turn**: before the answer starts, Iva makes up to three attempts with 5 and 15 second waits and honours `Retry-After`. An opened stream or an executed tool is never replayed.
+- 🤖 **`gpt-6.1-sol` in the ChatGPT subscription list**: Iva identifies as Codex client 0.159.2, so `/model` and `iva config` show the new model.
+- 📅 **Task deadlines are stored as dates**: "tomorrow" becomes `YYYY-MM-DD` in the owner's timezone before it is saved, and a deadline can be corrected with `update`. Old deadlines written as words stay as they are.
+- 🔧 **Google CLI updates without root**: `iva update` installs and refreshes `gws` under the service user's `~/.local`. Google sign-in and settings stay as they are.
+- ⏰ **The nightly memory time is configurable**: `MEMORY_NIGHT_TIME=HH:mm` in `.env`, 04:00 by default. It takes effect after `iva update --force`.
+- 🔀 **OpenCode Go models over Responses**: `OPENCODE_PROTOCOL=responses` in `.env` switches the Go text wire, with the same key and model settings. chat/completions stays the default.
+- 📝 **The nightly Report reads like a note**: 2–5 plain lines in the owner's language, built by code from the night's results. The Report is still off by default.
+- 🃏 **A Card status on the owner's word**: "the project is closed" sets the Card status at once through `write_card`, and the night of that day keeps it.
 
-### 26.08.2026
+### 29.09.2026
 
-#### v0.3.33
+#### v0.4.10
 
-- 🧾 **Long and formatted messages no longer vanish**: since Bot API 10.1 a client puts such a message in `rich_message` instead of `text` (up to 32768 characters against 4096), and the Bridge admitted only the content keys it already knew, dropping the rest with nothing in the log but an update id — short messages were answered, long ones ignored, `/restart` changed nothing. The Bridge now judges the envelope: any message from an Allowlist user that carries at least one key outside the Bot API metadata is admitted, and what is readable is the agent's call — its rich-message reader has been in place since 0.3.25, so a new Bot API field arrives on its own. With nothing readable inside (`poll`, `contact`, a field Iva does not know yet), Iva answers once, `I can't read this message (fields: poll). Send it as text or a file.`, instead of staying silent. The drop line in `iva logs poll` now names the top-level keys — names only, no message text ever reaches the log. In a group the rule is unchanged: a message with no `text`/`caption` is admitted as a reply to the bot. Sending rich messages (`sendRichMessage` through the Outbox, since 0.3.25) is untouched. New troubleshooting section.
-- 📐 **The admission rule is written down: the Bridge judges the envelope, the Inbound pipeline judges the content**: [ADR-0011](docs/adr/0011-bridge-judges-the-envelope.md) records the boundary, the rejected alternatives (add one field to the key list, add a second normalizer to the Bridge, admit everything and stay silent) and the group gap it hands to `docs/tech-debt.md`.
+- 🚑 **A tool name from Claude no longer fails the turn**: an Iva tool runs only under its exact or `mcp__iva__` name, with no guessing by case, dash or another prefix. Any other name, Claude's own `Bash` and `Read` included, returns a tool error listing the available tools, and the model goes on in the same turn.
+- 🔌 **Unparsable tool arguments on Claude no longer fail the turn**: arguments that are not JSON reach eve as sent, the model gets an input error and corrects the call in the same turn. A stream cut before the end of the message still fails.
+- ♻️ **A restart mid-reply no longer blocks the next messages**: on the next start Iva moves the interrupted workflow state to quarantine, Bridge closes the broken turn with one line and drains the saved queue, and `/new` answers without `iva reset`. A second start in a row leaves the workflow state alone, and a failed recovery is one journal line that does not keep Iva down.
+- 🔎 **File search no longer hangs the turn**: one `grep` or `glob` call stops after 20 seconds, 20 000 files or when the turn is stopped, and returns what it found with a hint to narrow the path. `node_modules`, `.git` and `*.trash-*` quarantines are skipped.
+- 🧠 **Sonnet 5.5 takes the place of Sonnet 5 on Claude**: the model screen and setup offer Fable 5.1, Opus 5.5 and Sonnet 5.5 and write `claude-sonnet-5-5` to `.env`. A Claude Code that does not know Sonnet 5.5 yet keeps Sonnet 5 on the same button, and `claude-sonnet-5` in `.env` still works. The OpenRouter list offers `anthropic/claude-sonnet-5.5`.
 
 </details>
 
