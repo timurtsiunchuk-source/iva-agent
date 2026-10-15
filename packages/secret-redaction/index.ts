@@ -10,11 +10,33 @@
 // собранный рантайм (RUNTIME_SOURCE_TREES в scripts/lib/custom-layer.ts).
 //
 // Правило не угадывает секрет по виду значения: секрет — значение ЛЮБОГО ключа, кроме
-// закрытого списка настроек, плюс пароль из userinfo URL, токен бота в любом месте строки,
-// личный id рядом с меткой и e-mail.
+// закрытого списка настроек, плюс пароль из userinfo URL, ключ известного формата в любом
+// месте строки (таблица KEY_SHAPES: токен бота, `sk-…`, `ghp_…`, `xox…-`, `AKIA…`, JWT,
+// `Bearer …`), личный id рядом с меткой и e-mail.
 
 /** Пометка вырезанного. Тот же вид, что в правилах про evidence (AGENTS.md). */
 export const REDACTED = "<redacted>";
+
+/** Installation credentials: placeholders and a single repeated character are ordinary values. */
+export function isSecretValue(value: string): boolean {
+  const characters = [...value];
+  return characters.length >= 12 && new Set(characters).size > 1;
+}
+
+/** Eligible credentials selected from the shared inventory supplied by the caller. */
+export function secretEntriesFromEnv(
+  env: Record<string, string | undefined>,
+  names: readonly string[],
+): Array<{ name: string; value: string }> {
+  return names.flatMap((name) => {
+    const value = env[name];
+    return value === undefined
+      ? []
+      : secretValuesFromEnv({ [name]: value })
+          .filter(isSecretValue)
+          .map((value) => ({ name, value }));
+  });
+}
 
 /**
  * Имя ключа `.env`, значение которого НЕ секрет: каталог, модель, провайдер, зона, язык,
@@ -45,7 +67,7 @@ const URL_PASSWORD = /^(?:[A-Za-z][A-Za-z\d+.-]*:\/\/)?[^\s/@:]*:([^\s/@]+)@/u;
 /**
  * Настройки САМОГО ПРОЦЕССА, а не установки: в `.env` таких ключей нет, а в `process.env`
  * они есть всегда — и их значения не секреты. Без этого списка хвост журнала расписания
- * терял смысл: `HOME=/Users/john` вырезал начало каждого пути, `USER=john` — слог внутри
+ * терял смысл: `HOME=/Users/user` вырезал начало каждого пути, `USER=user` — слог внутри
  * слов, `SHLVL=1` — каждую единицу (слепая приёмка T20, раунды 2-3). Переменные systemd
  * (`MANAGERPID`, `SYSTEMD_EXEC_PID`, `INVOCATION_ID`, `JOURNAL_STREAM`) — той же природы:
  * их пишет systemd в окружение сервиса, и pid со stream попадают в хвост провала (T30 v2).
@@ -55,12 +77,43 @@ const PROCESS_SETTING_KEY =
 /** Ключи со списком личных id: их значения делятся по запятой и пробелам. */
 const CHAT_ID_KEY = /(?:_CHAT_ID|_USER_IDS|_API_ID)$/u;
 /**
- * Токен бота в ЛЮБОМ месте строки. Границы слова тут вредны: в журнале токен стоит внутри
- * URL — `api.telegram.org/bot<token>/sendMessage`, — и lookbehind срывался на букве `t`
- * из `bot`, пропуская чужой токен в пакет (T21). У формы `<5+ цифр>:<25+ знаков>` ложных
- * срабатываний нет, поэтому режем без оглядки на соседей.
+ * Ключи известных форматов: их режем по виду, потому что такого ключа может не быть ни в
+ * `.env`, ни в `.env` плагина — модель вставила его в команду, инструмент напечатал чужой
+ * ключ, и тот уезжал в пакет и в адрес issue (находка Q4 волны Trace). Строка — формат и
+ * его шаблон; первая группа шаблона, если она есть, — слово-примета, которое остаётся
+ * перед пометкой (`Bearer <redacted>`).
+ *
+ * Границы слова у большинства форматов не ставим: ключ стоит и внутри URL, и токен бота
+ * терялся ровно на этом — lookbehind срывался на букве `t` из `bot<token>` (T21). Граница
+ * слева есть только там, где без неё режется обычный текст или проход становится
+ * квадратичным: `sk-` — хвост слов `risk-…`, `task-…`, `desk-…`; JWT — начало `eyJ`
+ * внутри длинной цепочки знаков. Короткое не режется: у каждого формата не меньше 10 знаков
+ * после приметы, поэтому слово `skills`, хеш коммита (40 hex без приметы) и адрес без ключа
+ * остаются целыми. Похожая таблица есть у outbound Gate (agent/lib/security-gate.ts), но у
+ * неё другая задача — назвать находку в ответе модели, а не вырезать её из пакета улик.
  */
-const TELEGRAM_TOKEN_RE = /\d{5,}:[A-Za-z0-9_-]{25,}/gu;
+const KEY_SHAPES: ReadonlyArray<readonly [format: string, shape: RegExp]> = [
+  // `<5+ цифр>:<25+ знаков>` шире формата Bot API (8-10 цифр, 35 знаков) и ложных
+  // срабатываний не даёт. `(?<!\d)` смысла не меняет — старт внутри той же цепочки цифр
+  // кончается там же, — но без него 100 КБ цифр без `:` резались 10 секунд: каждая
+  // позиция заново проходила цепочку до конца.
+  ["Telegram bot token", /(?<!\d)\d{5,}:[A-Za-z0-9_-]{25,}/gu],
+  // `sk-…`, `sk-proj-…`, `sk-ant-api03-…`, `sk-or-v1-…`: тело ключа несёт `-` и `_`.
+  ["OpenAI, Anthropic, OpenRouter", /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}/gu],
+  ["GitHub token ghp_ gho_ ghu_ ghs_ ghr_", /gh[pousr]_[A-Za-z0-9]{20,}/gu],
+  ["GitHub fine-grained token", /github_pat_[A-Za-z0-9_]{20,}/gu],
+  [
+    "Slack token xoxa- xoxb- xoxp- xoxr- xoxs-",
+    /xox[abprs]-[A-Za-z0-9-]{10,}/gu,
+  ],
+  ["AWS access key id", /AKIA[0-9A-Z]{16}/gu],
+  ["Google API key", /AIza[0-9A-Za-z_-]{35}/gu],
+  [
+    "JWT",
+    /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/gu,
+  ],
+  ["Authorization: Bearer", /\b(Bearer\s+)[A-Za-z0-9._~+/-]{16,}=*/giu],
+];
 /**
  * Личный id рядом с меткой: `tg:555000111222:43`, `chat_id=…`, `chatId: …`, `from=…`.
  * Работает БЕЗ `.env` — иначе chat id из журнала хода уезжает в пакет (личные данные).
@@ -105,8 +158,8 @@ function secretForms(secret: string): string[] {
 }
 
 /**
- * Чистая: каждая форма секрета, токен бота в любом месте строки, личный id рядом с меткой и
- * e-mail становятся пометкой. Формы режутся ОДНИМ проходом и от длинной к короткой: иначе
+ * Чистая: каждая форма секрета, ключ известного формата в любом месте строки, личный id
+ * рядом с меткой и e-mail становятся пометкой. Формы режутся ОДНИМ проходом и от длинной к короткой: иначе
  * второй проход резал бы буквы внутри только что вставленной пометки, а короткая форма
  * съедала бы начало длинной (короткий секрет-префикс оставлял хвост длинного — T21).
  * Форма короче 4 знаков режется только на границе слова: однобуквенный пароль `p` внутри
@@ -137,7 +190,10 @@ function formPattern(form: string): string {
     ? `(?<![\\p{L}\\p{N}])${raw}(?![\\p{L}\\p{N}])`
     : raw;
 }
-export function redact(text: string, secrets: readonly string[]): string {
+export function redactSecretValues(
+  text: string,
+  secrets: readonly string[],
+): string {
   const forms = new Set<string>();
   for (const secret of secrets)
     for (const form of secretForms(secret))
@@ -150,10 +206,26 @@ export function redact(text: string, secrets: readonly string[]): string {
       REDACTED,
     );
   }
-  return out
-    .replace(TELEGRAM_TOKEN_RE, REDACTED)
+  return out;
+}
+
+export function redact(text: string, secrets: readonly string[]): string {
+  return cutKeyShapes(redactSecretValues(text, secrets))
     .replace(TELEGRAM_ID_RE, `$1${REDACTED}`)
     .replace(EMAIL_RE, REDACTED);
+}
+
+/** Каждый ключ известного формата — пометка; слово-примета из первой группы остаётся. */
+function cutKeyShapes(text: string): string {
+  return KEY_SHAPES.reduce(
+    (out, [, shape]) =>
+      out.replace(
+        shape,
+        (_match, kept: unknown) =>
+          `${typeof kept === "string" ? kept : ""}${REDACTED}`,
+      ),
+    text,
+  );
 }
 
 /**

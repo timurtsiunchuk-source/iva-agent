@@ -10,10 +10,10 @@
 // security-граница: у bash полный host-доступ, обойти можно всегда — цель в том, чтобы
 // модель не сделала это СЛУЧАЙНО по прямой просьбе из чата.
 //
-// Матчим не сырую строку, а КОМАНДНЫЕ ПОЗИЦИИ: строку чистим от кавычек (shell их снимет
-// перед исполнением — `iva "restart"` летален ровно так же), режем на сегменты по
-// разделителям команд и с начала каждого сегмента снимаем обёртки (sudo, env, timeout,
-// bash -c…). Поэтому `rg -n 'iva restart' docs/` и `echo "iva restart"` проходят — там
+// Матчим КОМАНДНЫЕ ПОЗИЦИИ: сохраняем границы аргументов при разрезе на команды,
+// затем снимаем кавычки и обёртки (sudo, env, timeout, bash -c…). Shell тоже снимает
+// кавычки перед исполнением: `iva "restart"` летален ровно так же.
+// Поэтому `rg -n 'iva restart' docs/` и `echo "iva restart"` проходят — там
 // "iva" аргумент, а не команда, — а любая форма реального вызова ловится.
 //
 // Намеренно НЕ блокируем: status/journalctl по любым юнитам, рестарт таймеров iva-memory-*
@@ -21,6 +21,7 @@
 // iva doctor ЗАБЛОКИРОВАН: его ремонтные ветки (перегенерация bearer, exposed-listener)
 // сами рестартуют iva.service (bin/iva.mjs) — из чата доктора запускает кнопка в /menu,
 // она идёт через мост, не через агента.
+import { plainDataCommand, plainHelpCommand } from "./plain-shell-command.ts";
 
 // Кавычки и экранирование убираем ДО матчинга: для наших паттернов (имена команд и юнитов
 // без пробелов) снятие кавычек эквивалентно тому, что увидит execve после разбора shell.
@@ -65,11 +66,47 @@ export type CommandPosition = {
   readonly command: string;
 };
 
+// Исполняемый текст в shell, eval и printf -v сохраняет прежний консервативный разбор.
+function splitCommands(command: string): string[] {
+  const executable = command.replace(/'[^']*'/g, "");
+  if (
+    /\\\n|[$`]/.test(executable) ||
+    /\beval\b|\bprintf\s+-v|\bawk\b|\b(?:node|perl|ruby)\s+-\S*e\b|\bpython[\d.]*\s+-\S*c\b|[|>]&?\s*\(*\s*(?:ba|da|z)?sh\b|\b(?:ba|da|z)?sh\s+-\S*c\b/.test(
+      normalize(command),
+    )
+  )
+    return normalize(command).split(SEGMENT_SPLIT);
+  const quoted: string[] = [];
+  const masked = command.replace(
+    /\\[^]|'[^']*'|"(?:\\[^]|[^"\\])*"/g,
+    (part) => {
+      quoted.push(part);
+      return `\0${quoted.length - 1}\0`;
+    },
+  );
+  return masked
+    .split(SEGMENT_SPLIT)
+    .map((part) =>
+      part.replace(
+        /\0(\d+)\0/g,
+        (_, index: string) => quoted[Number(index)] ?? "",
+      ),
+    );
+}
+
 export function commandSegments(command: string): CommandPosition[] {
   const out: CommandPosition[] = [];
-  for (const raw of normalize(command).split(SEGMENT_SPLIT)) {
-    const segment = raw.trim();
-    let seg = raw.trimStart();
+  for (const raw of splitCommands(command)) {
+    const segment = normalize(raw).trim();
+    const named = raw.replace(
+      /^(\s*)('[^']*'|"(?:\\[^]|[^"\\])*")(?=\s|$)/,
+      (_, space: string, name: string) => space + name.replace(/\s/g, "?"),
+    );
+    let seg = normalize(
+      named.replace(/'[^']*'|"(?:\\[^]|[^"\\])*"/g, (part) =>
+        part.replace(/[<>]/g, "?"),
+      ),
+    ).trimStart();
     for (;;) {
       const m = WRAPPER.exec(seg) ?? ASSIGNMENT_PREFIX.exec(seg);
       if (!m || !m[0].trim()) break;
@@ -122,6 +159,7 @@ const RULES: Array<{ re: RegExp; what: string }> = [
  * иначе null. Текст адресован модели: объясняет, почему нельзя, и что предложить.
  */
 export function selfRestartViolation(command: string): string | null {
+  if (plainDataCommand(command) || plainHelpCommand(command)) return null;
   for (const seg of commandPositions(command)) {
     for (const { re, what } of RULES) {
       if (re.test(seg)) {

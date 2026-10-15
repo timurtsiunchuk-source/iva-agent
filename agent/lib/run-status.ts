@@ -2,12 +2,12 @@
 // канал (agent/channels/telegram.ts) читают/пишут файлы data/run-status.d/*.json.
 //
 // Зачем: мост решает, доставлять сообщение в eve или буферизовать (агент занят),
-// берёт отсюда sessionId+turnId для отмены хода по кнопке ⏹ Стоп, а канал
 // пишет сюда пульс живого хода, чтобы жнец моста не снял его как протухший.
 // Отдельный файл на chatKey не даёт параллельной записи одного чата потерять статус
 // другого. Запись одного ключа защищена O_EXCL-локом и атомарна (unique tmp+rename).
 // ЛЮБАЯ успешная запись двигает generation и updatedAt — на updatedAt держится и
-// жнец, и пульс (agent/lib/telegram-turn-start.ts).
+// жнец, и пульс (agent/lib/telegram-turn-start.ts). Одно исключение — запись входа очереди
+// (setChatStatusIf с touch: false): она не продлевает жизнь чужому ходу.
 //
 // chatKey = `${chatId}:${threadId ?? ""}` — тот же ключ, что chatKey() Bridge.
 
@@ -48,7 +48,6 @@ const errorCode = (error: unknown): string | undefined =>
 
 // Путь от cwd, как в usage.ts, а НЕ от import.meta.url: канал инлайнится в кэш
 // authored-modules eve, откуда «две папки вверх» указывают в node_modules/.cache.
-// Оба процесса (iva.service и мост) стартуют из одного WorkingDirectory (корень установки Ивы).
 const DATA_DIR = dataDir();
 const LEGACY_STATUS_FILE = join(DATA_DIR, "run-status.json");
 const STATUS_DIR = join(DATA_DIR, "run-status.d");
@@ -65,6 +64,14 @@ const LOCK_TIMEOUT_MS = positiveMs(
   5_000,
 );
 const LOCK_RETRY_MS = 10;
+
+// Вход очереди хранит время и сессию сообщения, ожидающего живой ход.
+// Следующий ход забирает свой вход; reset и захват очищают поля одним патчем.
+export const QUEUED_STATUS_CLEARED = {
+  queuedIngressId: null,
+  queuedIngressAt: null,
+  queuedSessionId: null,
+} as const;
 
 // Ход длиннее этого считаем зависшим/осиротевшим (упал без terminal-события):
 // мост перестаёт буферизовать, чтобы сообщения не копились вечно.
@@ -150,11 +157,14 @@ function readCurrent(chatKey: string): StatusRecord | null {
 }
 
 // Статус хода — не публичные данные: и лок, и сам файл создаются под 0600.
-function acquireChatLock(file: string): FileLock {
+export function acquireChatLock(
+  file: string,
+  staleMs = LOCK_STALE_MS,
+): FileLock {
   const lock = `${file}.lock`;
   const held = acquireFileLockSync(lock, {
     timeoutMs: LOCK_TIMEOUT_MS,
-    staleMs: LOCK_STALE_MS,
+    staleMs,
     retryMs: LOCK_RETRY_MS,
     mode: 0o600,
   });
@@ -284,10 +294,16 @@ export function isCompacting(chatKey: string, now = Date.now()): boolean {
   return isRunning(chatKey, now) && getChatStatus(chatKey)?.compacting === true;
 }
 
+// Чем запись метит updatedAt: обычная — временем записи, запись знака очереди — прежним.
+type Stamp = (prev: StatusRecord) => number | undefined;
+const stampNow: Stamp = () => Date.now();
+const keepStamp: Stamp = (prev) => prev.updatedAt;
+
 function updateChatStatus(
   chatKey: string,
   patch: StatusPatch,
   expected: StatusPatch | null,
+  stamp: Stamp,
 ): StatusRecord | null {
   const file = statusFileOf(chatKey);
   const lock = acquireChatLock(file);
@@ -312,9 +328,23 @@ function updateChatStatus(
       ...prev,
       ...patch,
       generation: previousGeneration + 1,
-      updatedAt: Date.now(),
+      updatedAt: stamp(prev),
     };
     delete next[RETIRED_SESSION_ROUTING_FIELD];
+    // Keep inherited message IDs through heartbeats until the bridge can delete
+    // them. A terminal record or a different pair must retire the old Stop key.
+    if (
+      next.status !== "running" ||
+      next.sessionId !== prev.sessionId ||
+      next.turnId !== prev.turnId
+    )
+      for (const field of [
+        "statusMessageId",
+        "statusAt",
+        "queuedStatusMessageId",
+        "queuedStatusAt",
+      ])
+        delete next[field];
     for (const key of Object.keys(next))
       if (next[key] === null) delete next[key];
     writeCurrent(file, next);
@@ -329,17 +359,25 @@ export function setChatStatus(
   chatKey: string,
   patch: StatusPatch,
 ): StatusRecord {
-  return updateChatStatus(chatKey, patch, null) as StatusRecord;
+  return updateChatStatus(chatKey, patch, null, stampNow) as StatusRecord;
 }
 
 // Atomic compare-and-set для terminal Eve events: reset может успеть удалить
-// sessionId между ранним read и записью позднего события.
+// sessionId между ранним read и записью позднего события. touch: false — запись, которая не
+// говорит «ход жив» (вход очереди), updatedAt не двигает: иначе запись мёртвого хода
+// прожила бы ещё RUN_STALE_MS. generation растёт всегда — на нём держатся CAS.
 export function setChatStatusIf(
   chatKey: string,
   expected: StatusPatch,
   patch: StatusPatch,
+  options?: { touch?: boolean },
 ): StatusRecord | null {
-  return updateChatStatus(chatKey, patch, expected);
+  return updateChatStatus(
+    chatKey,
+    patch,
+    expected,
+    options?.touch === false ? keepStamp : stampNow,
+  );
 }
 
 export function parseTelegramSessionRetirement(

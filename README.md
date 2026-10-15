@@ -59,7 +59,7 @@ The bridge long-polls Telegram, so no public HTTPS, domain or webhook is needed.
 - **Web search** — four pluggable providers: Tavily, Exa, Parallel or Brave.
 - **Google Workspace** — Gmail, Calendar, Drive, Sheets, Docs and Tasks from chat via the `gws` CLI; installed for you, with a guided key setup right in the conversation.
 - **Skills & MCP** — drop one file to add a procedure or connect an MCP server; keys stay in `.env`.
-- **Personal Telegram — userbot (beta)** — read and send from your _own_ account, not just the bot; connect by chat (QR, no terminal). Rough and buggy — opt-in, **at your own risk**. A server-side anti-ban guardrail (FloodWait compliance + randomized pacing + circuit-breaker) is enforced, not just advised. [Details](docs/userbot.md).
+- **Personal Telegram — userbot** — read and send from your _own_ account, not just the bot; connect by chat (QR, no terminal). Opt-in, **at your own risk**. A server-side anti-ban guardrail (FloodWait compliance + randomized pacing + circuit-breaker) is enforced, not just advised. [Details](docs/userbot.md).
 - **Safe to forward** — forwarded text, captions and voice transcripts pass an injection screen before the model reads them. A flagged message or transcript reaches the model tagged as data rather than as an instruction; for media captions the screen runs but the tag does not travel with it yet.
 - **Token accounting** — every model step is logged; `/usage` reports it for free.
 
@@ -85,7 +85,7 @@ Full architecture and search internals: [docs/memory.md](docs/memory.md).
 
 <img src="assets/iva-userbot.webp" alt="Your secretary inside Telegram: the userbot reads group chats from your own account, collects summaries and replies as you, guarded by a server-enforced anti-ban guardrail" width="100%">
 
-The bot is half of Telegram. The other half is your personal account: connect the userbot (beta, opt-in) and Iva works from it like a secretary — reads the group chats you never keep up with, folds them into summaries, catches the messages that actually need you, and replies as you.
+The bot is half of Telegram. The other half is your personal account: connect the userbot (opt-in) and Iva works from it like a secretary — reads the group chats you never keep up with, folds them into summaries, catches the messages that actually need you, and replies as you.
 
 - **All of Telegram** — groups, channels, unreads, search and the full history of your personal account.
 - **Onboarding in chat** — tell the bot to connect your Telegram, scan a QR. No terminal.
@@ -93,7 +93,7 @@ The bot is half of Telegram. The other half is your personal account: connect th
 - **Read-only mode** — one `.env` switch and Iva can read and search but physically cannot send.
 
 > [!WARNING]
-> Automating a personal account is against Telegram's ToS and can get the account limited or banned. The userbot is opt-in, beta, and used at your own risk — reading is far safer than sending. Details: [docs/userbot.md](docs/userbot.md).
+> Automating a personal account is against Telegram's ToS and can get the account limited or banned. The userbot is opt-in and used at your own risk — reading is far safer than sending. Details: [docs/userbot.md](docs/userbot.md).
 
 ## Security & privacy
 
@@ -168,47 +168,53 @@ Default model is deepseek-v4-pro, 131k context. On Go it runs about $14–15/mo 
 
 Документация на русском → [docs/ru/](docs/ru/)
 
+## eve sources
+
+Iva carries eve 0.51.1 sources from vercel/eve in `eve/`, with our changes under Apache-2.0 and the original NOTICE. Maintainers build the package once; installations fetch the pinned archive. See [building and publishing eve](docs/eve.md).
+
 ## What's New
 
 <details>
-<summary><b>v0.4.12 · 05.10.2026 — expand the latest releases</b></summary>
+<summary><b>v0.5.0 · 15.10.2026 — expand the latest releases</b></summary>
 
-### 05.10.2026
+### 15.10.2026
 
-#### v0.4.12
+#### v0.5.0
 
-- 👀 **Iva tells you what you missed**: once an hour code checks unread private chats, mentions in Telegram and Gmail without newsletters; the model wakes only for something new and sends one message per item with buttons «To tasks», «Remind later», «Mute this one». Quiet hours at night, at most 5 messages a day, one toggle «Writes on her own» in `/menu` → Notices.
-- ☀️ **The Brief replaces the morning digest**: at 08:30 and 14:00 Iva sends an overview of tasks, calendar, mail, Telegram, connections and plugins. Change the time with a phrase («brief at 9»); `/digest` returns the same overview.
-- 🚨 **Failed jobs reach you with the cause and a Fix button**: user timers and plugin services are checked hourly; Iva's own failed jobs are explained instead of silently self-fixed and come first in the morning Brief. `iva signal <source> <text>` lets any local script hand Iva a message.
-- 🧩 **Iva writes her own plugins**: say «make a plugin that…». A plugin of skills and scripts she installs herself; one with code or MCP she only proposes, and it is installed after you tap Install in a private chat.
-- 🗜 **A long conversation is compacted between turns, not in the middle of an answer**: after a turn that reached 60% of the model window or 275k tokens, Iva compacts the conversation while nobody waits. A message sent meanwhile gets «Compacting the conversation, I'll answer in a moment.» and its answer right after.
-- 🧹 **Iva no longer asks you to press /new**: the «context window is N% full» line is gone; `/new` works as before.
-- 🎬 **Video, audio and files are handled by Iva herself, and she sees an image on disk**: the model gets facts about an attachment instead of orders not to touch it, and `read_file` on an image returns its description from the vision model.
+- 💬 **Replies appear as they are written, ■ stops the turn**: in private chats, Iva shows a draft and the current tool. The final answer arrives as a separate message.
+- 🎯 **Goal follows through to the result**: a helper checks for a reply or change on a schedule and keeps a plan within the boundaries you set. Iva brings the result or a question; you close the goal.
+- 🤝 **A helper takes long work into the background**: Iva hands it an assignment and keeps talking with you. She reports the outcome in the main chat; you can stop the helper in words.
+- 🛠 **eve is built from Iva's sources**: installation and updates download the ready archive `eve-0.51.1-iva.3` with Iva's changes.
+- 🔎 **Iva prepares the next step for your tasks**: Watch, Brief and Insight check current goals and prior declines. Iva cites the source and why she is writing now, then prepares a reply draft or checked next steps.
+- 🛡 **Secrets stay on the server**: before sending a file, Iva checks its contents, including binary files. Replies hide keys and tokens by value, even without a label.
+- 🔘 **Button questions handle slow sending**: choices survive delays, and tapping an old button again stays a duplicate. Links with special characters open in full, topic service events stay silent, and deleted tasks keep their identifiers.
+- 🔧 **DeepSeek continues after a tool call**: in thinking mode on Ollama Cloud and OpenCode Go, the model receives its reasoning along with the tool result.
+- 🌙 **Night preserves direct memory edits**: a conflict in one day lets the other days and the report finish. The updater preserves another process's lock and installs verified Google CLI; closed turns stay closed after a restart.
+- 🔧 **Iva retries the request up to three times after an empty response**: retries stay within the same step; previously Iva retried once.
 
-### 03.10.2026
+### 11.10.2026
 
-#### v0.4.11
+#### v0.4.17
 
-- 🌙 **Nightly memory works on a ChatGPT subscription again**: the night call now streams on every provider. Since 0.4.9 the subscription backend answered 400 on the first call of every night. The night's own low reasoning effort is no longer overridden by the chat default.
-- 🗂️ **A vault `.gitignore` no longer stops the night**: files the owner excludes are skipped and named in the log, the rest is committed and the day closes. Ignored files stay on disk, outside the backup.
-- 🔁 **A short provider failure no longer fails the turn**: before the answer starts, Iva makes up to three attempts with 5 and 15 second waits and honours `Retry-After`. An opened stream or an executed tool is never replayed.
-- 🤖 **`gpt-6.1-sol` in the ChatGPT subscription list**: Iva identifies as Codex client 0.159.2, so `/model` and `iva config` show the new model.
-- 📅 **Task deadlines are stored as dates**: "tomorrow" becomes `YYYY-MM-DD` in the owner's timezone before it is saved, and a deadline can be corrected with `update`. Old deadlines written as words stay as they are.
-- 🔧 **Google CLI updates without root**: `iva update` installs and refreshes `gws` under the service user's `~/.local`. Google sign-in and settings stay as they are.
-- ⏰ **The nightly memory time is configurable**: `MEMORY_NIGHT_TIME=HH:mm` in `.env`, 04:00 by default. It takes effect after `iva update --force`.
-- 🔀 **OpenCode Go models over Responses**: `OPENCODE_PROTOCOL=responses` in `.env` switches the Go text wire, with the same key and model settings. chat/completions stays the default.
-- 📝 **The nightly Report reads like a note**: 2–5 plain lines in the owner's language, built by code from the night's results. The Report is still off by default.
-- 🃏 **A Card status on the owner's word**: "the project is closed" sets the Card status at once through `write_card`, and the night of that day keeps it.
+- 🐚 **Iva runs server commands in bash**: they used to go through the minimal `/bin/sh` shell, and on Ubuntu and Debian ordinary bash syntax failed with «Syntax error». Iva corrected herself, but lost a step and logged a failure. Now such commands pass the first time.
+- 🛡 **Iva refuses harmless commands less often**: search and print commands (grep, echo, head, cut, wc, ls, getent) were refused when quoted text held words like «batch» or «at». Now they pass, and so does `iva … --help`. Restarting Iva and schedules that bypass reminders are blocked as before. Command chains with sed, heredoc text and git commit messages may still be refused (#287).
+- 📓 **A helper's draft no longer lands in the daily note**: when Iva handed part of the work to a helper, its raw answer was written to the daily note as her reply, though you never received it. Now the daily note holds only what Iva wrote to you.
 
-### 29.09.2026
+#### v0.4.16
 
-#### v0.4.10
+- 📨 **Messages sent while Iva is busy reach her together**: if you send several messages or files while she is answering, Iva gets them at once and answers once instead of replying to each in turn. Commands, replies to her messages and button taps still go separately. In «Interrupt» mode a new message waits until Iva has picked up the ones already collected.
+- 💬 **During long work you can see what Iva is busy with**: a private chat shows a streaming draft with the current tool. The native ■ control stops the turn. Groups and topics show typing and use `/stop`. The final answer arrives as a separate reply.
+- 🔎 **Iva searches on her own first, then asks**: before asking you a question, she checks her memory, chats and mail, the web and the server, and in the question she says what she has already checked. What to choose and whether something may be done she still asks you.
+- 📄 **Replacements in Word files no longer double up**: in a merged table cell, replacing «100» with «1000» gave «10000». Now each replacement is made once, and page breaks, tabs and pictures next to the text stay in place.
 
-- 🚑 **A tool name from Claude no longer fails the turn**: an Iva tool runs only under its exact or `mcp__iva__` name, with no guessing by case, dash or another prefix. Any other name, Claude's own `Bash` and `Read` included, returns a tool error listing the available tools, and the model goes on in the same turn.
-- 🔌 **Unparsable tool arguments on Claude no longer fail the turn**: arguments that are not JSON reach eve as sent, the model gets an input error and corrects the call in the same turn. A stream cut before the end of the message still fails.
-- ♻️ **A restart mid-reply no longer blocks the next messages**: on the next start Iva moves the interrupted workflow state to quarantine, Bridge closes the broken turn with one line and drains the saved queue, and `/new` answers without `iva reset`. A second start in a row leaves the workflow state alone, and a failed recovery is one journal line that does not keep Iva down.
-- 🔎 **File search no longer hangs the turn**: one `grep` or `glob` call stops after 20 seconds, 20 000 files or when the turn is stopped, and returns what it found with a hint to narrow the path. `node_modules`, `.git` and `*.trash-*` quarantines are skipped.
-- 🧠 **Sonnet 5.5 takes the place of Sonnet 5 on Claude**: the model screen and setup offer Fable 5.1, Opus 5.5 and Sonnet 5.5 and write `claude-sonnet-5-5` to `.env`. A Claude Code that does not know Sonnet 5.5 yet keeps Sonnet 5 on the same button, and `claude-sonnet-5` in `.env` still works. The OpenRouter list offers `anthropic/claude-sonnet-5.5`.
+### 10.10.2026
+
+#### v0.4.15
+
+- 🔧 **The userbot comes back after an update**: after `iva update` the userbot could keep restarting in a loop and never work. Now Iva prepares it before it starts and waits until it answers. If it cannot be prepared, the userbot is switched off, and Iva tells you in Telegram what stops working and where to turn it back on (`/menu`, 📡 Userbot screen, «Turn on»). `iva restart` leaves a working userbot as it is.
+- 🛠 **Telegram search through the userbot no longer trips up**: sometimes Iva named an account that does not exist or wrote «null» where nothing had to be given, and the request to the userbot failed. Now such a request goes to your connected account, and a chat can be given as a `t.me/name` link. Thanks to @Entset for the fix.
+- 🎙 **Iva spells names in voice notes the way you set them**: in `/menu`, on the «🎤 Voice» screen, tap «Names and terms» and list names and words separated by commas, for example OJ, Sonnet, Todoist. Voice transcripts will spell them the same way in every message. For now only words in Latin letters work; Iva shortens a list that is too long to what Deepgram accepts at once and tells you so. Deepgram charges a small extra per minute for this feature; without a list everything works as before.
+- ⏳ **When the model stays silent, Iva suggests /new**: if the model again and again does not start answering in the same conversation, Iva suggests sending `/new`. A long conversation may have become too heavy for the model, and `/new` starts a fresh one.
 
 </details>
 
@@ -216,7 +222,7 @@ Full history — [CHANGELOG.md](CHANGELOG.md).
 
 ## Built on
 
-[eve](https://eve.dev/docs/introduction) 0.51.1, Vercel's agent framework, runs the agent; Node 24's built-in SQLite runs the search index — no separate database. Iva grew out of [agent-second-brain](https://github.com/smixs/agent-second-brain) and [autograph](https://github.com/smixs/autograph) — that story is in [docs/memory.md](docs/memory.md).
+[eve](https://eve.dev/docs/introduction) 0.51.1-iva.3, Vercel's agent framework, runs the agent; Node 24's built-in SQLite runs the search index — no separate database. Iva grew out of [agent-second-brain](https://github.com/smixs/agent-second-brain) and [autograph](https://github.com/smixs/autograph) — that story is in [docs/memory.md](docs/memory.md).
 
 ## Thanks
 

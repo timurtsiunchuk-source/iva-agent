@@ -1,4 +1,5 @@
 import { defineHook } from "eve/hooks";
+import { TURN_KINDS, isHelperTurn } from "../lib/eve-auth.js";
 import { resolveModelProvider } from "../lib/model-provider.js";
 import {
   appendUsage,
@@ -17,7 +18,8 @@ import {
 
 // Учёт фактического расхода токенов. ОДИН хук ловит весь расход одного eve-агента без
 // двойного счёта: основной Telegram Channel и фоновые джобы через eve/client —
-// ход Watch и Brief, memory rollup (kind="http"). Шаги субагента (planner) приходят завёрнутыми
+// ход Watch, Brief и Insight, memory rollup (kind="http"). Ход Ивы через eve/client называет
+// свой вид заголовком (agent/lib/eve-auth.ts), и `source` строки — этот вид, а не "http". Шаги субагента (planner) приходят завёрнутыми
 // в "subagent.event" → слушаем оба события. Пишем по строке на шаг в data/usage.jsonl;
 // читают мост (/usage) и CLI (`iva usage`).
 //
@@ -27,10 +29,11 @@ import {
 // ВАЖНО: в отличие от transcript.ts НЕ фильтруем finishReason="tool-calls" — расход есть на
 // КАЖДОМ шаге модели, включая tool-call раунды.
 
-// Модель/провайдер не приходят в событие — используем тот же строгий выбор, что и runtime.
-const { name: PROVIDER, model: MODEL } = resolveModelProvider();
+// Модель провайдера приходит в завершённом событии шага; провайдер общий для всех узлов графа.
+const { name: PROVIDER, model: TEXT_MODEL } = resolveModelProvider();
 
 interface StepData {
+  providerModelId?: string;
   stepIndex: number;
   turnId: string;
   usage?: {
@@ -43,10 +46,38 @@ interface StepData {
 
 /** Чей шаг: сессия, канал, имя инлайн-субагента и родитель сессии-ребёнка. */
 interface StepOwner {
+  readonly model: string;
   readonly sessionId: string;
   readonly source: string;
   readonly subagent?: string;
   readonly parent?: ParentLike;
+}
+
+/** Кто начал сессию; ребёнок встроенного `agent` получает того же, что родитель. */
+interface Initiator {
+  readonly authenticator: string;
+  readonly attributes: Readonly<Record<string, string | readonly string[]>>;
+}
+
+/** Источник строки: вид хода Ивы из bearer-атрибута, иначе вид канала. */
+function sourceOf(ctx: {
+  readonly session: {
+    readonly auth?: {
+      readonly initiator: Initiator | null;
+      readonly current?: Initiator | null;
+    };
+  };
+  readonly channel: { readonly kind?: string };
+}): string {
+  if (isHelperTurn(ctx)) return "helper";
+  const initiator = ctx.session.auth?.initiator;
+  const turn =
+    initiator?.authenticator === "iva-bearer"
+      ? initiator.attributes.iva_turn
+      : undefined;
+  return typeof turn === "string" && TURN_KINDS.has(turn)
+    ? turn
+    : (ctx.channel.kind ?? "unknown");
 }
 
 function record(data: StepData, owner: StepOwner): void {
@@ -70,7 +101,7 @@ function record(data: StepData, owner: StepOwner): void {
     {
       source,
       provider: PROVIDER,
-      model: MODEL,
+      model: owner.model,
       sessionId,
       turnId: data.turnId ?? "",
       step: data.stepIndex ?? 0,
@@ -92,8 +123,9 @@ export default defineHook({
       // ребёнок встроенного agent идёт под своей сессией.
       recordStepInput(ctx.session.id, stepInputTokens(event.data.usage));
       record(event.data, {
+        model: event.data.providerModelId ?? TEXT_MODEL,
         sessionId: ctx.session.id,
-        source: ctx.channel.kind ?? "unknown",
+        source: sourceOf(ctx),
         parent: ctx.session.parent,
       });
     },
@@ -124,8 +156,9 @@ export default defineHook({
             ),
           },
           {
+            model: inner.data.providerModelId ?? TEXT_MODEL,
             sessionId: ctx.session.id,
-            source: ctx.channel.kind ?? "unknown",
+            source: sourceOf(ctx),
             subagent: event.data.subagentName,
           },
         );

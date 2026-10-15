@@ -1,12 +1,18 @@
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 /* eslint-disable @typescript-eslint/no-floating-promises, @typescript-eslint/require-await -- Node owns test registration; the async request double preserves the wizard boundary. */
 import "../fixtures/no-host-anthropic.ts";
 import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test, { type TestContext } from "node:test";
+import test, { after, mock, type TestContext } from "node:test";
 import { ContextWindowConfigurationError } from "../../agent/lib/context-window.ts";
 import { MODEL_PROVIDER_NAMES } from "#lib/model-provider.ts";
+import {
+  ModelValidationError,
+  validateModelSelection,
+} from "../lib/model-validation.ts";
 import { CATALOG } from "../lib/model-catalog.ts";
 import { DATA_DIR_ABS } from "./config.ts";
 import {
@@ -25,6 +31,31 @@ import {
   wizardActionAllowed,
   wizardPickProvider,
 } from "./wizards.ts";
+
+// Every wizard settings read uses this fixture, including the full callback path.
+const originalReadFile = fsPromises.readFile;
+const settingsRead = mock.method(
+  fsPromises,
+  "readFile",
+  (
+    path: Parameters<typeof originalReadFile>[0],
+    options?: Parameters<typeof originalReadFile>[1],
+  ) =>
+    typeof path === "string" && path.endsWith("/.env")
+      ? Promise.resolve(
+          options === "utf8"
+            ? "MODEL_PROVIDER=ollama\nOLLAMA_MODEL=deepseek-v4-pro\n"
+            : Buffer.from(
+                "MODEL_PROVIDER=ollama\nOLLAMA_MODEL=deepseek-v4-pro\n",
+              ),
+        )
+      : originalReadFile(path, options),
+);
+syncBuiltinESMExports();
+after(() => {
+  settingsRead.mock.restore();
+  syncBuiltinESMExports();
+});
 
 test("reset copy rejects an invalid context window with the typed error", () => {
   assert.throws(
@@ -343,6 +374,7 @@ test("saving custom writes the endpoint, the model and drops a key nobody wants"
   assert.deepEqual(seen[1].updates, {
     THINKING_EFFORT: null,
     MODEL_PROVIDER: "custom",
+    HELPER_MODEL: null,
     CUSTOM_MODEL: "some-model",
     CUSTOM_BASE_URL: "https://api.example.com/v1",
     // null сносит строку: старый ключ не должен уехать на новый эндпоинт.
@@ -415,7 +447,7 @@ function fakeClaudeForWizard(t: TestContext): {
       'let input = "";',
       'process.stdin.on("data", (chunk) => { input += chunk; });',
       'process.stdin.on("end", () => {',
-      '  process.stdout.write(JSON.stringify({ type: "control_response", response: { subtype: "success", response: { models: [{ value: "default", resolvedModel: "claude-opus-5-5[1m]" }, { value: "claude-fable-5-1[1m]", resolvedModel: "claude-fable-5-1" }, { value: "sonnet", resolvedModel: "claude-sonnet-5-5" }, { value: "haiku", resolvedModel: "claude-haiku-4-5-20251001" }] } } }) + "\\n");',
+      '  process.stdout.write(JSON.stringify({ type: "control_response", response: { subtype: "success", response: { models: [{ value: "default", resolvedModel: "claude-opus-5-5[1m]" }, { value: "claude-fable-5-1[1m]", resolvedModel: "claude-fable-5-1" }, { value: "sonnet", resolvedModel: "claude-sonnet-5-5" }, { value: "haiku", resolvedModel: "claude-haiku-5-5" }, { value: "claude-haiku-4-5-20251001", resolvedModel: "claude-haiku-4-5-20251001" }] } } }) + "\\n");',
       "});",
       "",
     ].join("\n"),
@@ -512,13 +544,18 @@ test("the claude model screen asks the CLI picker", async (t) => {
   assert.match(screen, /План: max|Plan: max/u);
   assert.deepEqual(
     st.modelOptions.map((option) => option.id),
-    ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"],
+    [
+      "claude-fable-5-1",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
+      "claude-haiku-5-5",
+    ],
   );
   assert.deepEqual(
     st.modelOptions.map((option) => option.label),
-    ["Fable 5.1", "Opus 5.5", "Sonnet 5.5"],
+    ["Fable 5.1", "Opus 5.5", "Sonnet 5.5", "Haiku 5.5"],
   );
-  assert.doesNotMatch(screen, /haiku|\[1m\]/u);
+  assert.doesNotMatch(screen, /claude-haiku-4|\[1m\]/u);
 });
 
 // Уровни рассуждения Claude: экран моделей несёт их у каждой модели, выбор модели ведёт на
@@ -563,17 +600,19 @@ test("picking a claude model asks the thinking level, and saving writes THINKING
   assert.deepEqual(written, {
     THINKING_EFFORT: "xhigh",
     MODEL_PROVIDER: "claude",
+    HELPER_MODEL: null,
     CLAUDE_MODEL: "claude-opus-5-5",
   });
 });
 
 // Прошлая модель Claude в .env (Sonnet 5, Opus 5): новый CLI её в кнопки не отдаёт — место
 // заняла новая, — но ход на ней идёт, и /think обязан дать сменить уровень, а не отвечать
-// «нет в каталоге». Пикер фейка отдаёт Sonnet 5.5 и Opus 5.5.
+// «нет в каталоге». Пикер фейка отдаёт Sonnet 5.5, Opus 5.5 и Haiku 5.5.
 for (const [index, model] of [
   "claude-sonnet-5-5",
   "claude-sonnet-5",
   "claude-opus-5",
+  "claude-haiku-5-5",
 ].entries()) {
   test(`/think on claude shows the thinking levels and the current one for ${model}`, async (t) => {
     const sent = telegramSpy(t);
@@ -696,5 +735,91 @@ test("model changes validate Go Responses and preserve the owner’s transport s
     written?.OPENCODE_PROTOCOL,
     undefined,
     "upsert leaves the configured protocol intact",
+  );
+});
+
+test("helper model choice invokes validation and writes only HELPER_MODEL", async () => {
+  let written: Record<string, string | null> | undefined;
+  let called = 0;
+  const env = {
+    MODEL_PROVIDER: "claude",
+    CLAUDE_MODEL: "claude-haiku-4-5-20251001",
+    CLAUDE_CONTEXT_WINDOW: "200000",
+    THINKING_EFFORT: "high",
+  };
+  const options = {
+    readEnv: async () => env,
+    validate: async (
+      selection: Parameters<typeof validateModelSelection>[0],
+    ) => {
+      called++;
+      return validateModelSelection(selection, {
+        probeClaude: async (model) => {
+          if (model === "future-unknown")
+            throw new Error("unknown Claude model");
+          return { id: model, reasoningLevels: [] };
+        },
+      });
+    },
+    write: async (updates: Record<string, string | null>) => {
+      written = updates;
+    },
+  };
+  await validateAndSaveWizard(
+    {
+      flow: "model",
+      provider: "claude",
+      model: "claude-sonnet-5-5",
+      effort: null,
+      helperModel: true,
+    } as never,
+    options,
+  );
+  assert.equal(called, 1);
+  assert.deepEqual(written, { HELPER_MODEL: "claude-sonnet-5-5" });
+  await assert.rejects(
+    validateAndSaveWizard(
+      {
+        flow: "model",
+        provider: "claude",
+        model: "future-unknown",
+        helperModel: true,
+      } as never,
+      options,
+    ),
+    (error: unknown) =>
+      error instanceof ModelValidationError &&
+      error.code === "catalog_unavailable",
+  );
+  assert.equal(called, 2);
+  const defaultConfig = await currentConfig({ readEnv: async () => env });
+  assert.equal(defaultConfig.helperModel, "claude-sonnet-5-5");
+  const same = await currentConfig({
+    readEnv: async () => ({ ...env, HELPER_MODEL: "" }),
+  });
+  assert.match(same.helperModel, /same as Iva|как у Ивы/);
+});
+
+test("R1 switching provider resets helper model and stale helper cannot save", async () => {
+  const env = { MODEL_PROVIDER: "ollama", HELPER_MODEL: "deepseek-v4-pro" };
+  let updates: Record<string, string | null> = {};
+  const st = {
+    flow: "model",
+    provider: "claude",
+    model: "claude-sonnet-5-5",
+    effort: "high",
+  };
+  const options = {
+    readEnv: async () => env,
+    validate: async () => ({ id: st.model, reasoningLevels: [] }),
+    write: async (next: Record<string, string | null>) => {
+      updates = next;
+    },
+  };
+  await validateAndSaveWizard(st as never, options);
+  assert.equal(updates.HELPER_MODEL, null);
+  await assert.rejects(
+    validateAndSaveWizard({ ...st, helperModel: true } as never, options),
+    /helper provider changed/,
   );
 });

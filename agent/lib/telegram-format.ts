@@ -65,10 +65,35 @@ function inlineHtml(text: unknown): string {
   // пробегает хвост на каждой позиции и вешает однопоточный мост (200k знаков - 41 с).
   // Подпись длиннее 200 знаков и URL длиннее 2048 в сообщение Telegram не поместятся,
   // так что отсечение живого текста не теряет.
-  s = s.replace(
-    /\[([^\]\n]{1,200})\]\((https?:\/\/[^\s)\n]{1,2048})\)/g,
-    (_m, t, u) => `<a href="${escAttr(u)}">${t}</a>`,
-  );
+  const link = /\[([^\]\n]{1,200})\]\((https?:\/\/)/g;
+  let linked = "",
+    cursor = 0,
+    match;
+  while ((match = link.exec(s))) {
+    let end = link.lastIndex,
+      depth = 0,
+      firstClose = -1;
+    for (; end < s.length && end < link.lastIndex + 2048; end++) {
+      const char = s[end];
+      if (/\s/.test(char) || (char === ")" && depth === 0)) break;
+      if (char === "(") depth++;
+      if (char === ")") {
+        if (firstClose < 0) firstClose = end;
+        depth--;
+      }
+    }
+    if (s[end] !== ")" || depth !== 0) end = firstClose;
+    if (end <= link.lastIndex) continue;
+    // Открывающий тег хранится в spans, подпись проходит правила разметки.
+    spans.push(
+      `<a href="${escAttr(match[2] + s.slice(link.lastIndex, end))}">`,
+    );
+    linked +=
+      s.slice(cursor, match.index) +
+      `\uE000${spans.length - 1}\uE001${match[1]}</a>`;
+    cursor = link.lastIndex = end + 1;
+  }
+  s = linked + s.slice(cursor);
   // bold
   s = s
     .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
@@ -84,7 +109,7 @@ function inlineHtml(text: unknown): string {
   s = s
     .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<i>$1</i>")
     .replace(/(?<!\w)_([^_\n]+)_(?!\w)/g, "<i>$1</i>");
-  // restore inline code
+  // restore protected spans
   return s.replace(/\uE000(\d+)\uE001/g, (_m, i) => spans[Number(i)] ?? "");
 }
 
@@ -604,8 +629,102 @@ export function withButtonTypes(md: string): string {
   });
 }
 
+/** Предел callback_data у Telegram: 64 байта UTF-8. Длиннее — 400 BUTTON_DATA_INVALID. */
+export const BUTTON_DATA_MAX_BYTES = 64;
+
+// Атом значения атрибута: HTML-сущность целиком или один символ (кодовая точка, флаг u).
+const ATTRIBUTE_ATOM_RE = /&(?:#\d+|#x[\da-f]+|[a-z]+);|[\s\S]/giu;
+
+/**
+ * Начало `data` в пределах 64 байт UTF-8: режется по границе символа и не посреди
+ * HTML-сущности. Байты считаются по сырому значению атрибута — так предел держится,
+ * разворачивает Telegram сущности или нет.
+ */
+export function shortenButtonData(
+  data: string,
+  maxBytes = BUTTON_DATA_MAX_BYTES,
+): string {
+  if (Buffer.byteLength(data) <= maxBytes) return data;
+  let out = "";
+  let bytes = 0;
+  for (const [atom] of data.matchAll(ATTRIBUTE_ATOM_RE)) {
+    bytes += Buffer.byteLength(atom);
+    if (bytes > maxBytes) break;
+    out += atom;
+  }
+  return out;
+}
+
+/**
+ * Укороченный `data`, совпавший с `data` кнопки выше в том же сообщении, получает хвост
+ * «#2», «#3»… в пределах 64 байт: Bridge узнаёт нажатие по chat:message:data
+ * (scripts/poller/control.ts, tapKey), и две одинаковые кнопки стали бы одной.
+ */
+function distinctData(data: string, seen: ReadonlySet<string>): string {
+  let short = shortenButtonData(data);
+  for (let n = 2; short !== data && seen.has(short); n++) {
+    const suffix = `#${n}`;
+    short =
+      shortenButtonData(
+        data,
+        BUTTON_DATA_MAX_BYTES - Buffer.byteLength(suffix),
+      ) + suffix;
+  }
+  return short;
+}
+
+const BUTTON_DATA_RE = /(<tg-button(?=[\s>])[^>]*?\sdata=")([^"]*)(")/gi;
+
+/**
+ * Модель пишет в `data` целую фразу, а одна длинная кнопка роняет всё rich-сообщение:
+ * Telegram отвергает его целиком, и ответ уходит HTML-путём уже без кнопок. Длинный
+ * `data` укорачивается до предела; тап приходит модели этим началом фразы, а совпавшие
+ * после укорачивания кнопки различаются хвостом «#N».
+ */
+export function shortenButtonsData(md: string): string {
+  const seen = new Set<string>();
+  return md.replace(
+    BUTTON_DATA_RE,
+    (_tag, head: string, data: string, tail: string) => {
+      const short = distinctData(data, seen);
+      seen.add(short);
+      if (short !== data)
+        console.error(
+          `[telegram] button data shortened: ${Buffer.byteLength(data)} → ${BUTTON_DATA_MAX_BYTES}`,
+        );
+      return head + short + tail;
+    },
+  );
+}
+
 export function hasRichButtons(md: unknown): boolean {
   return /<tg-button[\s>]/i.test(String(md));
+}
+
+// Чужой текст одной строкой внутри rich-сообщения: цитата вопроса владельца в сообщении о
+// сбое, фраза модели в статусе хода. Пробелы и переводы строк схлопнуты, длина — не больше
+// maxChars знаков, на обрезе «…». Разметкой текст стать не может: `<` и `>` заменены
+// угловыми кавычками (тег не откроется), знаки разметки `*_#|` экранированы, как в
+// escapeRichText (scripts/lib/telegram-buttons.ts), а с ними `` ` ``, `[`, `]`, `(`, `)`,
+// `~`, `$` и обратная косая: иначе `\*` из текста стал бы экранированной косой и голой
+// звёздочкой. Экранирован и `&`: из `&lt;tg-button…&gt;` разборщик, который сначала
+// разворачивает сущности, собрал бы настоящую кнопку, а `\&lt;` при любом порядке разбора
+// остаётся текстом. Обрезанный ключ гейт уже не узнаёт: текст, который гейт ещё не видел,
+// идёт через него до этой функции.
+export function richQuoteLine(text: string, maxChars: number): string {
+  const line = text.replace(/\s+/gu, " ").trim();
+  const chars = Array.from(line);
+  const cut =
+    chars.length <= maxChars
+      ? line
+      : `${chars
+          .slice(0, maxChars - 1)
+          .join("")
+          .trimEnd()}…`;
+  return cut
+    .replace(/</gu, "‹")
+    .replace(/>/gu, "›")
+    .replace(/([\\*_#|`[\]()~$&])/gu, "\\$1");
 }
 
 export function needsRichMessage(md: unknown): boolean {

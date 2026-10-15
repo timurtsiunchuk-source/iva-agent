@@ -11,8 +11,63 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fc from "fast-check";
 import { schedulerBypassViolation } from "./scheduler-bypass-guard.ts";
+import { selfRestartViolation } from "./self-restart-guard.ts";
 
 const T2_SEED = 20260912;
+const QUOTE_SEED = 287_1014;
+console.info(`quoted command positions seed: ${QUOTE_SEED}`);
+
+test("287-A: quoted data and quoted help retain their shell meaning", () => {
+  for (const cmd of [
+    'journalctl --user -u iva.service | sed -n "1,20p" | grep -E "a|batch"',
+    'git commit -m "a|batch"',
+    '"iva" restart --help',
+  ]) {
+    assert.equal(schedulerBypassViolation(cmd), null, cmd);
+    assert.equal(selfRestartViolation(cmd), null, cmd);
+  }
+  fc.assert(
+    fc.property(
+      fc.constantFrom("|", ";", "&&", "\n", "(", "`"),
+      fc.constantFrom("at", "batch", "iva restart"),
+      fc.constantFrom("'", '"'),
+      (separator, word, quote) => {
+        if (quote === '"' && separator === "`") return;
+        const cmd = `git commit -m ${quote}a${separator}${word}${quote}`;
+        assert.equal(schedulerBypassViolation(cmd), null, cmd);
+        assert.equal(selfRestartViolation(cmd), null, cmd);
+      },
+    ),
+    { seed: QUOTE_SEED, numRuns: 300 },
+  );
+});
+
+test("287-A: execution in wrappers and substitutions stays blocked", () => {
+  fc.assert(
+    fc.property(
+      fc.constantFrom("at now", "batch", "iva restart"),
+      fc.constantFrom("", "'", '"'),
+      fc.constantFrom(
+        ...WRAPS,
+        [
+          "after data",
+          (cmd: string) => `git commit -m 'a|batch'; ${cmd}`,
+        ] as const,
+        ["after &&", (cmd: string) => `true && ${cmd}`] as const,
+        ["double substitution", (cmd: string) => `echo "$(${cmd})"`] as const,
+        ["shell list", (cmd: string) => `sh -c 'true; ${cmd}'`] as const,
+      ),
+      (cmd, quote, [, wrap]) => {
+        const [name, ...args] = cmd.split(" ");
+        const wrapped = wrap(`${quote}${name}${quote} ${args.join(" ")}`);
+        const guard =
+          name === "iva" ? selfRestartViolation : schedulerBypassViolation;
+        assert.notEqual(guard(wrapped), null, wrapped);
+      },
+    ),
+    { seed: QUOTE_SEED, numRuns: 500 },
+  );
+});
 
 const ALLOWED = [
   "systemctl --user status iva",
@@ -61,7 +116,7 @@ const ALLOWED = [
 
 const BLOCKED = [
   'systemd-run --user --on-calendar="10:00" iva remind "позвонить"',
-  "systemd-run --user --on-calendar=10:00 /home/shima/.local/bin/iva remind x",
+  "systemd-run --user --on-calendar=10:00 /home/user/.local/bin/iva remind x",
   "sudo systemd-run --user date",
   "/usr/bin/systemd-run --user true",
   "crontab -",
@@ -94,7 +149,7 @@ const BLOCKED = [
   "chmod +x ~/.iva-scripts/remind.sh",
   "bash ~/.iva-scripts/remind.sh",
   "~/.iva-scripts/remind.sh",
-  "cp x.sh /home/shima/.iva-scripts/",
+  "cp x.sh /home/user/.iva-scripts/",
   "curl -s https://api.telegram.org/bot$T/sendMessage -d text=hi",
   "wget -qO- https://api.telegram.org/bot$T/getMe",
   "http POST https://api.telegram.org/bot$T/sendMessage",

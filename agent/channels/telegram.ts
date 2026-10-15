@@ -1,15 +1,27 @@
 import {
+  noteHelperReply,
+  finishHelperOutcomes,
+  discardHelperOutcomes,
+} from "../lib/helper-outcome.ts";
+import { randomInt, randomUUID } from "node:crypto";
+import {
   telegramChannel,
   type TelegramChannelState,
   type TelegramHandle,
   type TelegramMessageBody,
 } from "eve/channels/telegram";
 import { POST } from "eve/channels";
+import {
+  flushSettledTelegramQuestions,
+  postTelegramQuestion,
+  settleTelegramQuestions,
+} from "../lib/telegram-question.ts";
 // Outbox — ЕДИНЫЙ шов наружу (тот же, через который уходят ночные отчёты cron):
 // внутри него outbound-Gate, выбор rich/HTML, нарезка на чанки и plain-фолбэк.
 import {
   noticeSender,
   sendThroughOutbox,
+  type NoticeSend,
   type OutboxAck,
   type OutboxTransport,
 } from "../lib/outbox.js";
@@ -22,20 +34,25 @@ import {
 // Inbound-пайплайн — единственный вход внутрь: allowlist, решение о диспатче,
 // запись в Vault, медиа со зрением и транскрипцией, inbound-Gate и контекст хода.
 // Канал приносит ему эффекты и сам про разбор входящего ничего не знает.
-import { runTelegramInbound } from "../lib/telegram-inbound.js";
+import {
+  runTelegramInbound,
+  type TelegramInboundMessage,
+} from "../lib/telegram-inbound.js";
+import { mediaFromRaw } from "../lib/telegram-parts.js";
 import { traceOutbox } from "../lib/trace.js";
 import { chatModelSeesImages, describeImage } from "../vision.js";
 import { transcribe } from "../transcribe.js";
-// Статус-сообщение хода («Работаю…», кнопка Стоп, уборка в терминале) и служебное
-// объяснение сбоя — UI канала, обе реплики идут мимо Outbox. Мимо Outbox — не мимо
-// гейта: всё, во что подставлен runtime-контент, уходит через noticeSender.
 import {
-  enableWorkingStatusStop,
   finishTelegramStatus,
-  sendWorkingStatus,
-  TELEGRAM_STOP_CALLBACK,
-} from "../lib/telegram-status-message.js";
+  telegramDraftFetch,
+  telegramDraftTurn,
+  closeTelegramDraftTurn,
+  closeTelegramDraftChat,
+  startTelegramAcceptedTyping,
+  closeTelegramAcceptedTyping,
+} from "../lib/telegram-draft.ts";
 import { notifyTelegramFailure } from "../lib/telegram-failure-notice.js";
+import { rememberTurnQuestion, turnQuestion } from "../lib/turn-question.js";
 // Состояние «идёт ли ход» — per-chat файлы data/run-status.d с мостом telegram-poll.mjs:
 // мост по ним буферизует входящие, канал хранит sessionId/turnId для отмены.
 import {
@@ -52,7 +69,7 @@ import {
   handleTelegramCancelRequest,
   TELEGRAM_CANCEL_ROUTE,
 } from "../lib/telegram-cancel-route.js";
-import { handleTelegramStopCallback } from "../lib/telegram-stop.js";
+import { handleTelegramDraftStopRequest } from "../lib/telegram-stop.ts";
 // Свёртка между ходами: история пересказывается, пока человек ничего не ждёт, а чат на
 // это время занят записью running + compacting (agent/lib/idle-compaction.ts).
 import {
@@ -75,6 +92,8 @@ import {
 import {
   abandonTelegramEarlyStatus,
   chatTakeOverPatch,
+  detachQueuedSignTime,
+  dropQueuedStatus,
   emitTelegramTurnLatency,
   markTelegramFirstOutput,
   markTelegramTurnAlive,
@@ -85,14 +104,6 @@ import {
 
 // Токен (TELEGRAM_BOT_TOKEN) и секрет вебхука (TELEGRAM_WEBHOOK_SECRET_TOKEN)
 // читаются из окружения автоматически.
-
-// --- ESC-остановка хода (аналог ESC в Claude Code) ---
-//
-// turn.started шлёт «Работаю…» с кнопкой [⏹ Стоп] (agent/lib/telegram-status-message.ts)
-// и пишет running+sessionId+turnId в run-status. Нажатие кнопки (и /stop) ловит
-// МОСТ: он читает статус и зовёт POST /eve/v1/telegram/cancel, а тот — публичный cancel
-// eve из RouteHandlerArgs (agent/lib/eve-cancel.ts). Дальше eve абортит ход и присылает
-// turn.cancelled, который правит статус-сообщение.
 
 /**
  * Creates an Outbox transport that delivers a Telegram reply through Eve.
@@ -162,9 +173,11 @@ export function outboxTransport(
         res.status,
         JSON.stringify(res.body).slice(0, 300),
       );
+      const reason = (res.body as { description?: unknown } | null)
+        ?.description;
       return {
         ok: false,
-        error: `sendRichMessage ${res.status}`,
+        error: `sendRichMessage ${res.status}${typeof reason === "string" ? `: ${reason}` : ""}`,
         retryPlain: false,
       };
     } catch (err) {
@@ -187,6 +200,59 @@ export function outboxTransport(
                 retryPlain: false,
               };
   return transport;
+}
+
+// Вопрос хода для сообщения об обрыве (turn-question.ts): текст принятого сообщения чата и
+// метка вложения. Голос и фото без подписи стирают прежний вопрос.
+export async function rememberAccepted<T>(
+  chatKey: string,
+  message: TelegramInboundMessage,
+  turn: Promise<T | null>,
+): Promise<T | null> {
+  const accepted = await turn;
+  if (accepted !== null)
+    rememberTurnQuestion(chatKey, {
+      text: message.text || message.caption,
+      media:
+        message.attachments.length > 0 || mediaFromRaw(message.raw) !== null,
+    });
+  return accepted;
+}
+
+// Что сообщение об обрыве знает о вопросе. Чат не личный или тип неизвестен — цитаты нет:
+// её увидели бы все участники.
+function chatQuestion(channel: {
+  telegram: Pick<TelegramHandle, "chatId" | "messageThreadId">;
+  state: Pick<TelegramChannelState, "chatType">;
+}): { question?: string; media?: boolean; group: boolean } {
+  const tg = channel.telegram;
+  const group = channel.state.chatType !== "private";
+  const asked = tg.chatId
+    ? turnQuestion(chatKeyOf(tg.chatId, tg.messageThreadId))
+    : undefined;
+  return asked === undefined
+    ? { group }
+    : { question: asked.text, media: asked.media, group };
+}
+
+// Сообщение о сбое хода. Простой текст уходит одним sendMessage, как раньше; текст с кнопкой
+// «Повторить» (обрыв посреди ответа) — швом Outbox, потому что кнопка живёт только в
+// rich-сообщении (ADR-0015). Гейт стоит на обоих путях: noticeSender и сам шов.
+function failureSender(
+  tg: Pick<
+    TelegramHandle,
+    "chatId" | "messageThreadId" | "request" | "post" | "sendMessage"
+  >,
+): NoticeSend {
+  return noticeSender(async (text) => {
+    if (!hasRichButtons(text)) return tg.sendMessage(text);
+    const sent = await sendThroughOutbox(
+      text,
+      outboxTransport(tg, TELEGRAM_RICH_REPLIES),
+    );
+    if (!sent.ok) throw new Error(sent.error);
+    return sent;
+  });
 }
 
 // Пульс живого хода в run-status: без него жнец моста снимал молчаливый длинный ход
@@ -253,19 +319,8 @@ const telegram = telegramChannel({
   // ломается ни на каком провайдере. Файлы качает и сохраняет inbound-пайплайн, а модели отдаёт
   // ПУТЬ — посмотреть/прочитать она решает сама своими инструментами; не умеет — честно скажет.
   uploadPolicy: "disabled",
-  // Кнопка ⏹ Стоп, пришедшая прямо в канал. В long-poll мост съедает колбэк раньше
-  // (scripts/poller/main.ts зовёт handleControl до любой доставки), и этот путь не
-  // срабатывает; он существует для webhook-режима, где моста нет вовсе. Отмена идёт
-  // тем же публичным маршрутом — POST на собственный cancel-роут.
-  // ВАЖНО: наличие этого хука закрывает дефолтную ветку eve НАВСЕГДА — «Unsupported
-  // action.» на не-HITL колбэки больше не отправляется. Поэтому чужой колбэк гасим
-  // сами пустым answerCallbackQuery: иначе у нажавшего вечный спиннер на кнопке.
-  //
-  // Кнопки, написанные моделью, в long-poll до этого хука не доходят вовсе: мост
-  // превращает тап в обычное сообщение (scripts/poller/control.ts) и отдаёт его
-  // inbound pipeline — подать сообщение в сессию каналу нечем, у него только Bot API,
-  // а inbound pipeline читает сообщения. В webhook-режиме (моста нет) такой тап
-  // остаётся без доставки: здесь он только гаснет.
+  api: { fetch: telegramDraftFetch() },
+  // Unknown callbacks receive a quiet acknowledgement.
   onCallbackQuery: async (ctx, query) => {
     const ack = async (text?: string) => {
       try {
@@ -277,56 +332,91 @@ const telegram = telegramChannel({
         /* протухший callback_query_id Telegram отвергает штатно */
       }
     };
-    if (query.data !== TELEGRAM_STOP_CALLBACK) {
-      await ack();
-      return;
-    }
-    // Моста в этом режиме нет, поэтому о неостановленном ходе канал говорит сам: текст
-    // уходит уже после ответа на колбэк. Кнопки рестарта тут нет — рестарт делает мост.
-    const chatId = query.message?.chat?.id;
-    await handleTelegramStopCallback(query, {
-      ackImpl: ack,
-      notifyImpl: async (text) => {
-        if (chatId === undefined) return;
-        await ctx.telegram.request("sendMessage", { chat_id: chatId, text });
-      },
-    });
+    await ack();
   },
   events: {
-    // Начало хода: сначала публикуем running, затем отправляем медленное статус-сообщение.
-    // FIFO-мост не должен успеть принять следующую голову, пока Bot API отвечает.
+    async "input.requested"(data, channel, ctx) {
+      await closeTelegramDraftTurn(
+        ctx.session.id,
+        data.turnId,
+        undefined,
+        true,
+      );
+      for (const request of data.requests)
+        await postTelegramQuestion(request, channel.state, channel.telegram, {
+          rich: TELEGRAM_RICH_REPLIES === "auto",
+          continuation: channel.continuation,
+        });
+    },
+    async "input.resolved"(data, channel) {
+      try {
+        detachQueuedSignTime({
+          chatKey: chatKeyOf(
+            channel.telegram.chatId,
+            channel.telegram.messageThreadId,
+          ),
+          getStatusImpl: getChatStatus,
+          setStatusIfImpl: setChatStatusIf,
+        });
+      } catch (error) {
+        console.error("[telegram] знак очереди не отвязан от ответа:", error);
+      }
+      await settleTelegramQuestions(
+        data.resolutions,
+        channel.state,
+        channel.telegram,
+      );
+    },
     async "turn.started"(data, channel, ctx) {
       const tg = channel.telegram;
       openIdleCompactionTurn(ctx.session.id);
-      await publishTelegramTurnStarted({
+      const draftId = randomInt(1, 2 ** 31);
+      const published = await publishTelegramTurnStarted({
         chatKey: chatKeyOf(tg.chatId, tg.messageThreadId),
         sessionId: ctx.session.id,
         turnId: data.turnId,
+        draftId,
         getStatusImpl: getChatStatus,
         setStatusIfImpl: setChatStatusIf,
-        sendWorkingStatusImpl: (options) => sendWorkingStatus(tg, options),
-        enableWorkingStatusStopImpl: (messageId) =>
-          enableWorkingStatusStop(tg, messageId),
-        removeWorkingStatusImpl: (messageId) =>
-          tg.request("deleteMessage", {
-            chat_id: tg.chatId,
-            message_id: messageId,
-          }),
         onWorkingStatusError: (error) =>
-          console.error("[telegram] статус-сообщение не отправилось:", error),
+          console.error("[telegram] turn claim failed:", error),
       });
+      telegramDraftTurn(
+        tg,
+        ctx.session.id,
+        data.turnId,
+        published &&
+          channel.state.chatType === "private" &&
+          tg.messageThreadId === undefined,
+        { sessionId: ctx.session.id, turnId: data.turnId, draftId },
+        published,
+      );
+      await flushSettledTelegramQuestions(channel.state, channel.telegram);
     },
-    // Решение о свёртке от уборки статуса не зависит: её сбой не отменяет пересказ.
     async "turn.completed"(_data, channel, ctx) {
+      if (!ctx?.session) return;
+      await finishHelperOutcomes(
+        { sessionId: ctx.session.id, turnId: _data.turnId },
+        Date.now(),
+      );
       try {
-        await finishTelegramStatus(channel, ctx.session.id, "completed");
+        await flushSettledTelegramQuestions(channel.state, channel.telegram);
       } finally {
-        closeIdleCompactionTurn(ctx.session.id, providerConfig.contextWindow);
+        try {
+          await finishTelegramStatus(
+            channel,
+            ctx.session.id,
+            "completed",
+            _data.turnId,
+          );
+        } finally {
+          closeIdleCompactionTurn(ctx.session.id, providerConfig.contextWindow);
+        }
       }
     },
-    // Отмена во время пересказа между ходами (/stop) — не отмена хода: чат просто свободен,
-    // отметки «ход отменён» следующему сообщению не оставляем.
     async "turn.cancelled"(_data, channel, ctx) {
+      if (!ctx?.session) return;
+      discardHelperOutcomes(ctx.session.id, _data.turnId);
       const tg = channel.telegram;
       const status = getChatStatus(chatKeyOf(tg.chatId, tg.messageThreadId));
       const compacting =
@@ -336,17 +426,12 @@ const telegram = telegramChannel({
           channel,
           ctx.session.id,
           compacting ? "completed" : "cancelled",
+          compacting ? undefined : _data.turnId,
         );
       } finally {
         dropIdleCompactionTurn(ctx.session.id);
       }
     },
-    // Парковка сессии. После хода: если он дошёл до порога, занять чат и попросить eve
-    // пересказать историю (agent/lib/idle-compaction.ts). После пересказа — успеха, сбоя или
-    // обрыва — eve паркует сессию снова, и та же уборка освобождает чат.
-    // Она же страховка: если терминальное turn-событие потерялось (краш), парковка снимает
-    // busy-флаг и удаляет осиротевший «Работаю…». После обычного финала CAS по sessionId
-    // не совпадает — no-op.
     async "session.waiting"(_data, channel, ctx) {
       const sessionId = ctx.session.id;
       const chatKey = chatKeyOf(
@@ -374,8 +459,16 @@ const telegram = telegramChannel({
           releaseImpl: () => releaseCompactionClaim(chatKey, sessionId),
         });
       }
+      await flushSettledTelegramQuestions(channel.state, channel.telegram);
     },
     "message.appended"(_data, channel, ctx) {
+      telegramDraftTurn(
+        channel.telegram,
+        ctx.session.id,
+        _data.turnId,
+        channel.state.chatType === "private" &&
+          channel.telegram.messageThreadId === undefined,
+      )?.append(_data.stepIndex, _data.messageDelta);
       markTelegramFirstOutput({
         chatKey: chatKeyOf(
           channel.telegram.chatId,
@@ -387,30 +480,54 @@ const telegram = telegramChannel({
       });
       keepTurnAlive(channel, ctx);
     },
-    // Пульс хода: тулзы — самый частый признак жизни длинного молчаливого хода.
-    // action.partial (промежуточный снимок стримящего тула) держит пульс и внутри
-    // ОДНОГО долгого вызова. Запись в run-status дросселирована внутри
-    // markTelegramTurnAlive, поэтому на частоте событий это ничего не стоит.
-    // Дефолт eve на этом событии — обновить «печатает…»; переопределяя его, обязаны
-    // сохранить это сами, иначе индикатор набора умрёт между вызовами тулзов.
-    async "actions.requested"(_data, channel, ctx) {
+    "actions.requested"(_data, channel, ctx) {
       keepTurnAlive(channel, ctx);
-      await channel.telegram.startTyping();
+      telegramDraftTurn(
+        channel.telegram,
+        ctx.session.id,
+        _data.turnId,
+        channel.state.chatType === "private" &&
+          channel.telegram.messageThreadId === undefined,
+      )?.requested(_data.stepIndex, _data.actions);
     },
     "action.partial"(_data, channel, ctx) {
+      telegramDraftTurn(
+        channel.telegram,
+        ctx.session.id,
+        _data.turnId,
+        channel.state.chatType === "private" &&
+          channel.telegram.messageThreadId === undefined,
+      );
       keepTurnAlive(channel, ctx);
     },
     "action.result"(_data, channel, ctx) {
+      telegramDraftTurn(
+        channel.telegram,
+        ctx.session.id,
+        _data.turnId,
+        channel.state.chatType === "private" &&
+          channel.telegram.messageThreadId === undefined,
+      )?.result(_data.result.callId);
       keepTurnAlive(channel, ctx);
     },
-    // Ответ модели уходит через Outbox — он же переопределяет дефолтную plain-доставку
-    // eve. Промежуточный текст перед tool-calls не шлём (зеркалим дефолт). Повторного
-    // хода модели на сбой доставки нет — ход уже закрыт, реформат произойдёт на следующем
-    // сообщении (ошибка видна в логе/vault). Латентность засчитываем, только если ни одно
-    // сообщение не потерялось: пустой рендер шов отдаёт с ok=false, поэтому проверки
-    // delivered у вызывающего больше нет.
     async "message.completed"(data, channel, ctx) {
-      if (data.finishReason === "tool-calls" || !data.message) return;
+      if (!ctx?.session) return;
+      if (data.finishReason === "tool-calls") {
+        telegramDraftTurn(
+          channel.telegram,
+          ctx.session.id,
+          data.turnId,
+          channel.state.chatType === "private" &&
+            channel.telegram.messageThreadId === undefined,
+        )?.completeStep(data.stepIndex, data.message ?? "");
+        return;
+      }
+      await closeTelegramDraftChat(
+        channel.telegram,
+        ctx.session.id,
+        data.turnId,
+      );
+      if (!data.message) return;
       const { text: message, silent } = parseTelegramDelivery(data.message);
       const recordDelivery = (delivered: boolean) =>
         emitTelegramTurnLatency({
@@ -424,9 +541,6 @@ const telegram = telegramChannel({
           getStatusImpl: getChatStatus,
           setStatusIfImpl: setChatStatusIf,
         });
-      // Trace: одна отправка — одно событие журнала, каким бы путём шов её ни увёз
-      // (rich, HTML, plain-фолбэк). Обёртка же ставит контекст хода, поэтому вердикт
-      // outbound-Gate внутри шва уезжает с тем же ключом (ADR-0010).
       const result = await traceOutbox(
         {
           turn: data.turnId,
@@ -442,29 +556,44 @@ const telegram = telegramChannel({
       );
       if (!result.ok) return;
       recordDelivery(true);
+      noteHelperReply(
+        { sessionId: ctx.session.id, turnId: data.turnId },
+        message,
+      );
     },
-    // Ход упал: статус прибираем по CAS, но сообщение об ошибке от него не гейтим —
-    // позднее terminal-событие всё равно должно объяснить пользователю, что произошло.
     async "turn.failed"(data, channel, ctx) {
+      if (!ctx?.session) return;
+      discardHelperOutcomes(ctx.session.id, data.turnId);
       dropIdleCompactionTurn(ctx.session.id);
       try {
-        await finishTelegramStatus(channel, ctx.session.id, "failed");
+        await finishTelegramStatus(
+          channel,
+          ctx.session.id,
+          "failed",
+          data.turnId,
+        );
       } catch {
         /* run-status не прибрался — сообщение об ошибке всё равно отправляем */
       }
       await notifyTelegramFailure(
         ctx.session.id,
         data.turnId,
-        data,
-        noticeSender((text) => channel.telegram.sendMessage(text)),
+        { ...data, ...chatQuestion(channel) },
+        failureSender(channel.telegram),
       );
     },
-    // У terminal-сбоя eve следом за turn.failed шлёт session.failed без ctx.
-    // Повторно прибираем run-status по sessionId из payload и не дублируем уведомление.
     async "session.failed"(data, channel) {
-      if (channel.telegram.chatId) {
+      discardHelperOutcomes(data.sessionId);
+      const tg = channel.telegram;
+      if (tg.chatId) {
         try {
           await finishTelegramStatus(channel, data.sessionId, "failed");
+          await dropQueuedStatus({
+            chatKey: chatKeyOf(tg.chatId, tg.messageThreadId),
+            sessionId: data.sessionId,
+            getStatusImpl: getChatStatus,
+            setStatusIfImpl: setChatStatusIf,
+          });
         } catch {
           /* best-effort: отсутствие chat-state не должно ломать уведомление */
         }
@@ -472,8 +601,8 @@ const telegram = telegramChannel({
       await notifyTelegramFailure(
         data.sessionId,
         null,
-        data,
-        noticeSender((text) => channel.telegram.sendMessage(text)),
+        { ...data, ...chatQuestion(channel) },
+        failureSender(channel.telegram),
       );
     },
   },
@@ -481,59 +610,44 @@ const telegram = telegramChannel({
   onMessage: wrapTelegramQueueOnMessage((ctx, message) => {
     const tg = ctx.telegram;
     const chatKey = chatKeyOf(message.chat.id, message.messageThreadId);
-    let earlyIngressId: string | null = null;
-    return runTelegramInbound(message, {
-      botUsername: tg.botUsername,
-      request: (method, body) => tg.request(method, body),
-      sendMessage: noticeSender((text) => tg.sendMessage(text)),
-      startTyping: () => tg.startTyping(),
-      describeImage,
-      chatModelSeesImages,
-      transcribe,
-      onAccepted: async () => {
-        earlyIngressId = await publishTelegramEarlyStatus({
-          chatKey,
-          staleMs: RUN_STALE_MS,
-          getStatusImpl: getChatStatus,
-          setStatusIfImpl: setChatStatusIf,
-          sendWorkingStatusImpl: (options) => sendWorkingStatus(tg, options),
-          removeWorkingStatusImpl: (messageId) =>
-            tg.request("deleteMessage", {
-              chat_id: tg.chatId,
-              message_id: messageId,
-            }),
-          onWorkingStatusError: (error) =>
-            console.error(
-              "[telegram] раннее статус-сообщение не отправилось:",
-              error,
-            ),
-        });
-      },
-      onAbandoned: async () => {
-        if (earlyIngressId === null) return;
-        await abandonTelegramEarlyStatus({
-          chatKey,
-          ingressId: earlyIngressId,
-          getStatusImpl: getChatStatus,
-          setStatusIfImpl: setChatStatusIf,
-          removeWorkingStatusImpl: (messageId) =>
-            tg.request("deleteMessage", {
-              chat_id: tg.chatId,
-              message_id: messageId,
-            }),
-          onWorkingStatusError: (error) =>
-            console.error(
-              "[telegram] раннее статус-сообщение не удалилось:",
-              error,
-            ),
-        });
-      },
-      consumeCancelledMark: () => {
-        if (!getChatStatus(chatKey)?.wasCancelled) return false;
-        setChatStatus(chatKey, { wasCancelled: null });
-        return true;
-      },
-    });
+    const ingressId = randomUUID();
+    return rememberAccepted(
+      chatKey,
+      message,
+      runTelegramInbound(message, {
+        botUsername: tg.botUsername,
+        request: (method, body) => tg.request(method, body),
+        sendMessage: noticeSender((text) => tg.sendMessage(text)),
+        startTyping: () => tg.startTyping(),
+        describeImage,
+        chatModelSeesImages,
+        transcribe,
+        onAccepted: async () => {
+          const claimed = await publishTelegramEarlyStatus({
+            chatKey,
+            ingressId,
+            staleMs: RUN_STALE_MS,
+            getStatusImpl: getChatStatus,
+            setStatusIfImpl: setChatStatusIf,
+          });
+          if (claimed) startTelegramAcceptedTyping(tg, claimed);
+        },
+        onAbandoned: async () => {
+          closeTelegramAcceptedTyping(tg, ingressId);
+          await abandonTelegramEarlyStatus({
+            chatKey,
+            ingressId,
+            getStatusImpl: getChatStatus,
+            setStatusIfImpl: setChatStatusIf,
+          });
+        },
+        consumeCancelledMark: () => {
+          if (!getChatStatus(chatKey)?.wasCancelled) return false;
+          setChatStatus(chatKey, { wasCancelled: null });
+          return true;
+        },
+      }),
+    );
   }),
 });
 
@@ -550,7 +664,22 @@ if (!telegramWebhookRoute || telegramWebhookRoute.transport === "websocket") {
 export default {
   ...telegram,
   routes: [
-    ...telegram.routes,
+    ...telegram.routes.map((route) =>
+      route === telegramWebhookRoute
+        ? {
+            ...route,
+            handler: (
+              request: Request,
+              args: Parameters<typeof telegramWebhookRoute.handler>[1],
+            ) =>
+              handleTelegramDraftStopRequest(
+                request,
+                (req) => telegramWebhookRoute.handler(req, args),
+                process.env.TELEGRAM_WEBHOOK_SECRET_TOKEN,
+              ),
+          }
+        : route,
+    ),
     POST<TelegramChannelState>(TELEGRAM_ACCEPTANCE_ROUTE, (request, args) =>
       handleAcceptedTelegramWebhook(
         telegramWebhookRoute.handler,

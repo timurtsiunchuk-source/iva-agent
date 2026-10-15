@@ -131,9 +131,10 @@ session-retirement story, rather than leaving the override in place indefinitely
 
 `/menu` → **🔔 Notices** (`scripts/lib/menu/notices.ts`) switches the nightly memory reports
 (`memoryReports.enabled`) and **Writes on her own** — Watch and the Brief, which replaced the
-morning digest (`proactive.enabled`, ADR-0020) — so neither needs a raw `settings.json` edit.
-Both keys are read at fire time, so a tap applies on the next tick with no restart. The rules
-the screen enforces: ADR-0007 and ADR-0020.
+morning Report (`proactive.enabled`, ADR-0020) — so neither needs a raw `settings.json` edit,
+and **Insight** (`proactive.insightTimes`): a switch and three times.
+All three keys are read at fire time, so a tap applies on the next tick with no restart. The rules
+the screen enforces: ADR-0007, ADR-0020 and ADR-0022.
 
 ## 8. TypeScript-only Node source
 
@@ -227,7 +228,7 @@ partial guarantee at the cost of a second delivery path around the inbound pipel
 the shape ADR-0005 exists to avoid. `docs/security.md` states the limit instead, in the
 section "Telegram text: an annotation, not a filter".
 
-The fix is upstream, and the feature request to file against `vercel/eve` is small: let the
+The fix is upstream; the feature request is filed as vercel/eve#4605 (10.10.2026) and is small: let the
 inbound hook return the text the model will see, as one optional field beside `context` —
 
 ```ts
@@ -265,3 +266,36 @@ creates a fresh session per turn and reads its stream from index 0, so the drain
 the prompt nonce and the foreign-result check are removed.
 
 The `ai` pin is gone: Iva used to override `ai` to 7.0.39 against eve 0.51.1's peer `ai ^7.0.82`, so eve's bundled `@ai-sdk/code-mode` (it imports `experimental_toolCaller`) did not link and any Workflow/code-mode tool would crash server start. `package.json` now asks for `ai ^7.0.82` with no override. ADR-0013 rejected the workflow-tool route for Reminders (variant C) partly on that pin; the pin no longer stands in its way, the rest of the ADR's reasoning does.
+
+## 17. Insight follow-ups for the next wave
+
+- **A code-free draft changed after the Insight message installs only from the owner's terminal**: `iva plugin propose` refuses a draft without `mcp.json` and `sh.iva/` (`scripts/cli/plugin-cli-proposal.ts`); allowing it there, checked against `expectDigest12`, gives that draft a button.
+- **A transitional update builds the Version twice**: the old CLI names the Version from a fingerprint with skills (`scripts/lib/version-update.ts`), the new `warnUnbuiltCustom` (`scripts/cli/services.ts`) compares a fingerprint without them, so installs with skills in `data/custom` get one extra rebuild and a false "run: iva update" on `iva restart`, once.
+- **A healthy `iva diagnose` prints 3–4 `! would …` lines**: `ensureBearer` and `ctx.repair()` in `scripts/cli/doctor.ts` print in read mode unconditionally; the fix needs the "repair needed" predicates of `scripts/cli/systemd.ts` and `scripts/lib/version-store.ts` exposed through `api()`.
+
+## 18. Update lock takeover residual windows
+
+`acquireUpdateLock` serializes two new contenders reclaiming an abandoned owner by rename and owner.json comparison. The ownerless `mkdir → owner.json` publication window has a five-second grace, checked both before and after rename: two null contents alone cannot identify an abandoned directory (`UpdateLock-ownerless.cfg`, `UpdateLock-ownerless-unsafe.cfg`). A publisher stalled beyond the grace can lose its ownerless directory. A third contender can claim the temporarily empty path before restoration, and a legacy updater still deletes a successor by path (`UpdateLock-three.cfg`, `UpdateLock-mixed.cfg`). A crash while a live successor's directory is displaced also leaves the original path available to another contender. A displaced live owner is kept in `update.lock.stale-*` and logged if restoration finds an occupied path; version sweep removes forgotten directories older than a day while retaining live owners. The mixed window lasts until old updaters are retired; the three-contender window remains part of the directory protocol.
+
+Startup recovery uses the same chat-status lock with a two-second stale threshold; ordinary chat writers retain their usual thirty-second threshold. A killed writer's fresh lock becomes reclaimable within two seconds. A live synchronous writer stalled beyond this recovery threshold can lose its lock (`FileLock-sync-slow.cfg`); normal writes must finish well within the threshold.
+
+## 19. Daily-summary conflicts with absent or matching body hashes
+
+A direct edit during the model's day response is kept by that night. A mismatching
+`body_hash` also keeps the edited summary on subsequent automatic and manual nights,
+including a cached open pass. This N1 case is closed and covered by the single
+three-night process test in `scripts/memory/night-process.test.ts` ("mismatch summary
+survives three nights"). The two N1 cases with an absent or matching `body_hash`
+remain open: the next night can overwrite the edited summary. The day cache retains
+the model answer and open pass, while the expected summary snapshot and detected conflict live only
+in the first process. This is existing behavior in baseline `91dd9bb6` and release
+`0.4.17`. QA round 3 reproduced both open cases across three nights with a separate
+probe in `.scratch/work/fixes-1013/fixes2-qa3-probes`; the report is
+`.scratch/work/fixes-1013/fixes2-qa3-opus.md`. The repeated-night message
+"день ждёт владельца" has no test assertion. The two open data-loss cases remain
+release blockers under ADR-0002.
+
+Persisting a summary-conflict flag in the existing day pass would carry the decision
+across processes. That changes the stored cache format and needs a separate decision;
+the narrow repair leaves this proposal for review. Existing Card-conflict deferrals
+continue to preserve pending facts while other days, CORE, periods and Report finish.

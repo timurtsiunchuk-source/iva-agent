@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { traceContextParts, traceTurnBound } from "./trace.ts";
 import { localStamp } from "./vault-daily.ts";
 import { resolveVaultDir } from "@iva/vault-dir";
+import { QUEUED_STATUS_CLEARED } from "./run-status.ts";
 
 type ChatStatus = Record<string, unknown> | null;
 type GetStatus = (chatKey: string) => ChatStatus;
@@ -9,6 +10,7 @@ type SetStatusIf = (
   chatKey: string,
   expected: Record<string, unknown>,
   patch: Record<string, unknown>,
+  options?: { touch?: boolean },
 ) => unknown;
 
 export interface PublishTelegramEarlyStatusOptions {
@@ -18,10 +20,6 @@ export interface PublishTelegramEarlyStatusOptions {
   staleMs?: number;
   getStatusImpl: GetStatus;
   setStatusIfImpl: SetStatusIf;
-  sendWorkingStatusImpl: (options: {
-    canStop: false;
-  }) => Promise<number | null | undefined>;
-  removeWorkingStatusImpl?: (messageId: number) => Promise<unknown>;
   onWorkingStatusError?: (error: unknown) => void;
 }
 
@@ -29,14 +27,10 @@ export interface PublishTelegramTurnStartedOptions {
   chatKey: string;
   sessionId: string;
   turnId: string;
+  draftId: number;
   now?: () => number;
   getStatusImpl: GetStatus;
   setStatusIfImpl: SetStatusIf;
-  sendWorkingStatusImpl?: (options: {
-    canStop: true;
-  }) => Promise<number | null | undefined>;
-  enableWorkingStatusStopImpl?: (messageId: number) => Promise<unknown>;
-  removeWorkingStatusImpl?: (messageId: number) => Promise<unknown>;
   onWorkingStatusError?: (error: unknown) => void;
 }
 
@@ -45,7 +39,6 @@ export interface AbandonTelegramEarlyStatusOptions {
   ingressId: string;
   getStatusImpl: GetStatus;
   setStatusIfImpl: SetStatusIf;
-  removeWorkingStatusImpl?: (messageId: number) => Promise<unknown>;
   onWorkingStatusError?: (error: unknown) => void;
 }
 
@@ -81,24 +74,15 @@ export type TurnHeartbeat = { sessionId: string; at: number };
 
 export interface TakeOverTelegramChatOptions {
   chatKey: string;
-  /** Что записать в освободившийся чат: chatTakeOverPatch(...) плюс поля своего хода. */
   patch: Record<string, unknown>;
   now?: () => number;
   staleMs?: number;
   getStatusImpl: GetStatus;
   setStatusIfImpl: SetStatusIf;
-  /** Уборка осиротевшего индикатора «Работаю…»; у кого нет своего Bot API-шва — no-op. */
-  removeWorkingStatusImpl?: (messageId: number) => Promise<unknown>;
   onWorkingStatusError?: (error: unknown) => void;
-  /** Запись, которую этот претендент не берёт вовсе; смотрится тем же чтением, что и CAS. */
   refuseImpl?: (status: ChatStatus) => boolean;
 }
 
-/**
- * Что записать в чат, доставшийся от мёртвого хозяина: тот же набор обнулений, что у канала,
- * плюс поля своего хода. Иначе поля протухшего хода (statusAt, firstOutputAt, latencyLogged,
- * resetAt) переезжают в запись нового хозяина и врут про его сроки.
- */
 export function chatTakeOverPatch(
   fields: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -106,20 +90,18 @@ export function chatTakeOverPatch(
     status: "running",
     ingressId: null,
     ingressAt: null,
-    statusAt: null,
     turnAt: null,
     firstOutputAt: null,
     sessionId: null,
     turnId: null,
     compacting: null,
-    statusMessageId: null,
+    draftId: null,
     latencyLogged: null,
     resetAt: null,
     ...fields,
   };
 }
 
-// Живой чужой ход: его индикатор уже на экране, а свой этот ход получит в turn.started.
 const freshRunning = (
   status: ChatStatus,
   at: number,
@@ -129,30 +111,6 @@ const freshRunning = (
   typeof status.updatedAt === "number" &&
   at - status.updatedAt < staleMs;
 
-// Индикатор протухшей записи: после захвата его больше никто не найдёт — прибирает тот, кто взял.
-const orphanWorkingStatusId = (status: ChatStatus): number | undefined =>
-  status?.status === "running" && typeof status.statusMessageId === "number"
-    ? status.statusMessageId
-    : undefined;
-
-/**
- * Убрать сообщение «Работаю…», за которым больше никто не следит. Сбой уборки не критичен:
- * сообщение живёт дольше, чем нужно, но состояние чата уже верно.
- */
-async function dropWorkingStatus(
-  messageId: number | undefined,
-  remove: ((messageId: number) => Promise<unknown>) | undefined,
-  onError: (error: unknown) => void = () => {},
-): Promise<void> {
-  if (messageId === undefined) return;
-  try {
-    await remove?.(messageId);
-  } catch (error) {
-    onError(error);
-  }
-}
-
-/** Всё, что нужно одной попытке клейма. */
 type ClaimStep = {
   readonly chatKey: string;
   readonly patch: Record<string, unknown>;
@@ -163,11 +121,9 @@ type ClaimStep = {
   readonly refuseImpl?: (status: ChatStatus) => boolean;
 };
 
-/** Попытка ровно одна: занятый чат — сразу нет, проигранный CAS — повод повторить. */
 function claimOnce(step: ClaimStep): {
   readonly taken: boolean;
   readonly live: boolean;
-  readonly orphanMessageId?: number;
 } {
   const current = step.getStatusImpl(step.chatKey);
   if (
@@ -184,28 +140,26 @@ function claimOnce(step: ClaimStep): {
     ? {
         taken: true,
         live: false,
-        orphanMessageId: orphanWorkingStatusId(current),
       }
     : { taken: false, live: false };
 }
 
-/**
- * Взять чат у осиротевшей записи — один путь на канал и на ход напоминания
- * (scripts/reminders/fire.ts), второй копии клейма в репозитории нет. Живой чужой ход не
- * трогаем вовсе: false — чат занят, запись не тронута. Клейм — CAS по generation, чтобы
- * конкурирующий претендент не украл состояние между read и write.
- */
-export async function takeOverTelegramChat({
+export function takeOverTelegramChat(
+  options: TakeOverTelegramChatOptions,
+): Promise<boolean> {
+  return Promise.resolve(claimChat(options) === "taken");
+}
+
+function claimChat({
   chatKey,
   patch,
   now,
   staleMs,
   getStatusImpl,
   setStatusIfImpl,
-  removeWorkingStatusImpl,
   onWorkingStatusError,
   refuseImpl,
-}: TakeOverTelegramChatOptions): Promise<boolean> {
+}: TakeOverTelegramChatOptions): "taken" | "live" | "lost" {
   const step: ClaimStep = {
     chatKey,
     patch,
@@ -218,32 +172,17 @@ export async function takeOverTelegramChat({
   const onError = onWorkingStatusError ?? (() => {});
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
-      const { taken, live, orphanMessageId } = claimOnce(step);
-      if (live) return false;
+      const { taken, live } = claimOnce(step);
+      if (live) return "live";
       if (!taken) continue;
-      await dropWorkingStatus(
-        orphanMessageId,
-        removeWorkingStatusImpl,
-        onError,
-      );
-      return true;
+      return "taken";
     }
   } catch (error) {
     onError(error);
   }
-  return false;
+  return "lost";
 }
 
-// Пульс живого хода. Жнец моста (scripts/poller/queue.ts) считает ход мёртвым по
-// возрасту updatedAt, а тот двигался только на старте хода, первом выводе и финале:
-// молчаливый ход на сорок минут (глубокий ресёрч) получал насильный idle, реальный
-// сброс континуации и ложь «ход оборвался» — при живом ходе. Теперь ход сам
-// подтверждает, что жив, из своих же событий.
-//
-// Дёшево: события идут пачками, поэтому запись в run-status дросселируется одной на
-// интервал и делается CAS-ом по sessionId — опоздавший пульс не воскресит уже
-// завершённый или сброшенный ход. Карта пульсов ключуется чатом, не сессией, поэтому
-// не растёт с числом ходов.
 export const TURN_HEARTBEAT_MIN_INTERVAL_MS = 60_000;
 const turnHeartbeats = new Map<string, TurnHeartbeat>();
 
@@ -256,102 +195,151 @@ const durationFromIngress = (ingressAt: unknown, at: unknown): number | null =>
     ? at - ingressAt
     : null;
 
-/**
- * Индикатор раннего статуса: отправить и привязать к записи. Запись могла уйти между
- * отправкой и привязкой (reset, чужой ход) — сообщение, за которым никто не следит,
- * прибираем сами; сбой отправки только журналируется, ход он не останавливает.
- */
-async function sendEarlyStatus({
-  chatKey,
-  ingressId,
-  now,
-  setStatusIfImpl,
-  sendWorkingStatusImpl,
-  removeWorkingStatusImpl,
-  onWorkingStatusError,
-}: {
-  readonly chatKey: string;
-  readonly ingressId: string;
-  readonly now: () => number;
-  readonly setStatusIfImpl: SetStatusIf;
-  readonly sendWorkingStatusImpl: (options: {
-    canStop: false;
-  }) => Promise<number | null | undefined>;
-  readonly removeWorkingStatusImpl?: (messageId: number) => Promise<unknown>;
-  readonly onWorkingStatusError?: (error: unknown) => void;
-}): Promise<void> {
-  let statusMessageId;
-  try {
-    statusMessageId = await sendWorkingStatusImpl({ canStop: false });
-  } catch (error) {
-    onWorkingStatusError?.(error);
-    return;
-  }
-  if (statusMessageId === null || statusMessageId === undefined) return;
-
-  const attached = setStatusIfImpl(
+function holdQueuedIngress(
+  chatKey: string,
+  current: ChatStatus,
+  ingressId: string,
+  ingressAt: number,
+  setStatusIfImpl: SetStatusIf,
+): void {
+  if (current?.queuedIngressId !== undefined) return;
+  setStatusIfImpl(
     chatKey,
-    { status: "running", ingressId },
-    { statusMessageId, statusAt: now() },
+    { status: "running", queuedIngressId: undefined },
+    {
+      queuedIngressId: ingressId,
+      queuedIngressAt: ingressAt,
+      queuedSessionId: sessionIdOf(current),
+    },
+    { touch: false },
   );
-  if (!attached)
-    await dropWorkingStatus(
-      statusMessageId,
-      removeWorkingStatusImpl,
-      onWorkingStatusError,
-    );
 }
 
-export async function publishTelegramEarlyStatus({
+const sessionIdOf = (current: ChatStatus): string | null =>
+  typeof current?.sessionId === "string" ? current.sessionId : null;
+
+const matches = (value: unknown, wanted: string | undefined): boolean =>
+  wanted === undefined || value === wanted;
+
+const finiteNumber = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+function queuedStatusOf(
+  current: ChatStatus,
+  sessionId: string,
+): Record<string, unknown> {
+  if (current?.queuedIngressId === undefined) return {};
+  const ingressAt =
+    current.queuedSessionId === sessionId
+      ? finiteNumber(current.queuedIngressAt)
+      : undefined;
+  return {
+    ...QUEUED_STATUS_CLEARED,
+    ...(ingressAt === undefined ? {} : { ingressAt }),
+  };
+}
+
+export function detachQueuedSignTime({
+  chatKey,
+  getStatusImpl,
+  setStatusIfImpl,
+}: Pick<
+  DropQueuedStatusOptions,
+  "chatKey" | "getStatusImpl" | "setStatusIfImpl"
+>): boolean {
+  const owner = getStatusImpl(chatKey)?.queuedIngressId;
+  return (
+    owner !== undefined &&
+    Boolean(
+      setStatusIfImpl(
+        chatKey,
+        { queuedIngressId: owner },
+        { queuedIngressAt: null },
+        { touch: false },
+      ),
+    )
+  );
+}
+
+export interface DropQueuedStatusOptions {
+  chatKey: string;
+  ingressId?: string;
+  sessionId?: string;
+  getStatusImpl: GetStatus;
+  setStatusIfImpl: SetStatusIf;
+  onWorkingStatusError?: (error: unknown) => void;
+}
+
+export function dropQueuedStatus({
+  chatKey,
+  ingressId,
+  sessionId,
+  getStatusImpl,
+  setStatusIfImpl,
+}: DropQueuedStatusOptions): Promise<boolean> {
+  const current = getStatusImpl(chatKey);
+  const owner = current?.queuedIngressId;
+  if (
+    owner === undefined ||
+    !matches(owner, ingressId) ||
+    !matches(current?.queuedSessionId, sessionId)
+  )
+    return Promise.resolve(false);
+  if (
+    !setStatusIfImpl(
+      chatKey,
+      { queuedIngressId: owner },
+      QUEUED_STATUS_CLEARED,
+      { touch: false },
+    )
+  )
+    return Promise.resolve(false);
+  return Promise.resolve(true);
+}
+
+export function publishTelegramEarlyStatus({
   chatKey,
   ingressId = randomUUID(),
   now = Date.now,
   staleMs = 30 * 60_000,
   getStatusImpl,
   setStatusIfImpl,
-  sendWorkingStatusImpl,
-  removeWorkingStatusImpl,
   onWorkingStatusError,
 }: PublishTelegramEarlyStatusOptions): Promise<string | null> {
   const ingressAt = now();
   // Мост пропускает реплаи на сообщения бота мимо busy-очереди, поэтому сюда можно
   // попасть, пока предыдущий ход ещё бежит. Клейм общий с ходом напоминания
-  // (takeOverTelegramChat): живой ход не трогаем — его индикатор уже на экране,
-  // а свой этот ход получит в turn.started; протухшую запись забираем и прибираем
-  // осиротевший индикатор мёртвого хода.
-  const claimed = await takeOverTelegramChat({
+  // (takeOverTelegramChat): живой ход не трогаем, а сообщению, вставшему за ним в
+  // очередь, сразу ставим знак (sendQueuedStatus) — иначе под ним пусто до конца
+  // чужого хода. Протухшую запись забираем и прибираем осиротевший индикатор.
+  const claimed = claimChat({
     chatKey,
     patch: chatTakeOverPatch({ ingressId, ingressAt }),
     now: () => ingressAt,
     staleMs,
     getStatusImpl,
     setStatusIfImpl,
-    removeWorkingStatusImpl,
     onWorkingStatusError,
   });
-  if (!claimed) return null;
-  await sendEarlyStatus({
-    chatKey,
-    ingressId,
-    now,
-    setStatusIfImpl,
-    sendWorkingStatusImpl,
-    removeWorkingStatusImpl,
-    onWorkingStatusError,
-  });
-  return ingressId;
+  if (claimed === "live")
+    holdQueuedIngress(
+      chatKey,
+      getStatusImpl(chatKey),
+      ingressId,
+      ingressAt,
+      setStatusIfImpl,
+    );
+  return Promise.resolve(claimed === "taken" ? ingressId : null);
 }
 
 export async function publishTelegramTurnStarted({
   chatKey,
   sessionId,
   turnId,
+  draftId,
   now = Date.now,
   getStatusImpl,
   setStatusIfImpl,
-  sendWorkingStatusImpl,
-  enableWorkingStatusStopImpl = async () => {},
-  removeWorkingStatusImpl = async () => {},
   onWorkingStatusError = () => {},
 }: PublishTelegramTurnStartedOptions): Promise<boolean> {
   // Trace: ключ апдейта ↔ ход. Единственное место, где события «до хода» (Bridge,
@@ -365,95 +353,62 @@ export async function publishTelegramTurnStarted({
     localStamp().date,
   );
   const current = getStatusImpl(chatKey);
-  if (
-    current?.status !== "running" ||
-    typeof current.ingressId !== "string" ||
-    current.ingressId.length === 0 ||
-    current.sessionId !== undefined
-  ) {
-    // Callback/HITL and proactive turns do not pass through onMessage. Preserve
-    // their existing status behavior with a generation CAS, while a reset
-    // tombstone always wins over a late old turn.
-    if (current?.resetAt !== undefined) return false;
-    let claimed;
-    try {
-      claimed = setStatusIfImpl(
+  try {
+    if (current?.resetAt !== undefined) {
+      await dropQueuedStatus({
         chatKey,
-        { generation: current?.generation },
+        getStatusImpl: () => current,
+        setStatusIfImpl,
+      });
+      return false;
+    }
+    const early =
+      current?.status === "running" &&
+      typeof current.ingressId === "string" &&
+      current.sessionId === undefined;
+    return Boolean(
+      setStatusIfImpl(
+        chatKey,
+        early
+          ? {
+              status: "running",
+              ingressId: current.ingressId,
+              sessionId: undefined,
+            }
+          : { generation: current?.generation },
         {
           status: "running",
           sessionId,
           turnId,
+          draftId,
           compacting: null,
-          statusMessageId: null,
           turnAt: now(),
           latencyLogged: null,
+          ...(early
+            ? current.queuedIngressId === undefined
+              ? {}
+              : QUEUED_STATUS_CLEARED
+            : queuedStatusOf(current, sessionId)),
         },
-      );
-    } catch (error) {
-      onWorkingStatusError(error);
-      return false;
-    }
-    if (!claimed || sendWorkingStatusImpl === undefined)
-      return Boolean(claimed);
-    let statusMessageId;
-    try {
-      statusMessageId = await sendWorkingStatusImpl({ canStop: true });
-    } catch (error) {
-      onWorkingStatusError(error);
-      return true;
-    }
-    if (statusMessageId === null || statusMessageId === undefined) return true;
-    const attached = setStatusIfImpl(
-      chatKey,
-      { status: "running", sessionId, turnId },
-      { statusMessageId },
+      ),
     );
-    if (!attached) {
-      try {
-        await removeWorkingStatusImpl(statusMessageId);
-      } catch (error) {
-        onWorkingStatusError(error);
-      }
-    }
-    return true;
-  }
-  try {
-    const adopted = setStatusIfImpl(
-      chatKey,
-      {
-        status: "running",
-        ingressId: current.ingressId,
-        sessionId: undefined,
-      },
-      {
-        sessionId,
-        turnId,
-        turnAt: now(),
-      },
-    );
-    if (!adopted) return false;
-    if (current.statusMessageId !== undefined) {
-      try {
-        await enableWorkingStatusStopImpl(current.statusMessageId as number);
-      } catch (error) {
-        onWorkingStatusError(error);
-      }
-    }
-    return true;
   } catch (error) {
     onWorkingStatusError(error);
     return false;
   }
 }
 
-export async function abandonTelegramEarlyStatus({
+export async function abandonTelegramEarlyStatus(
+  options: AbandonTelegramEarlyStatusOptions,
+): Promise<boolean> {
+  return (await dropQueuedStatus(options)) || abandonOwnEarlyStatus(options);
+}
+
+function abandonOwnEarlyStatus({
   chatKey,
   ingressId,
   getStatusImpl,
   setStatusIfImpl,
-  removeWorkingStatusImpl = async () => {},
-  onWorkingStatusError = () => {},
 }: AbandonTelegramEarlyStatusOptions): Promise<boolean> {
   const current = getStatusImpl(chatKey);
   if (
@@ -461,7 +416,7 @@ export async function abandonTelegramEarlyStatus({
     current.ingressId !== ingressId ||
     current.sessionId !== undefined
   ) {
-    return false;
+    return Promise.resolve(false);
   }
   const cleared = setStatusIfImpl(
     chatKey,
@@ -470,22 +425,14 @@ export async function abandonTelegramEarlyStatus({
       status: "idle",
       ingressId: null,
       ingressAt: null,
-      statusAt: null,
       turnAt: null,
       firstOutputAt: null,
-      statusMessageId: null,
+      draftId: null,
       latencyLogged: null,
     },
   );
-  if (!cleared) return false;
-  if (current.statusMessageId !== undefined) {
-    try {
-      await removeWorkingStatusImpl(current.statusMessageId as number);
-    } catch (error) {
-      onWorkingStatusError(error);
-    }
-  }
-  return true;
+  if (!cleared) return Promise.resolve(false);
+  return Promise.resolve(true);
 }
 
 export function markTelegramFirstOutput({
@@ -569,7 +516,6 @@ export function emitTelegramTurnLatency({
 
   const record = {
     event: "telegram_turn_latency",
-    ingressToStatusMs: durationFromIngress(current.ingressAt, current.statusAt),
     ingressToTurnMs: durationFromIngress(current.ingressAt, current.turnAt),
     ingressToFirstOutputMs: durationFromIngress(
       current.ingressAt,

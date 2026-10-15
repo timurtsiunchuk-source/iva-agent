@@ -2,6 +2,10 @@
 // and bare-Node operational scripts.
 
 import secretKeyInventory from "../skills/security-defense/outbound-sensitive-keys.json" with { type: "json" };
+import {
+  redactSecretValues,
+  secretEntriesFromEnv,
+} from "../../packages/secret-redaction/index.ts";
 import { traceInboundGate } from "./trace.ts";
 
 const INVISIBLE_RE = /[\p{Cf}\p{Cc}\u034F]/gu;
@@ -485,9 +489,8 @@ function judgeInbound(
 // which key leaked.
 // Ollama Cloud, DeepInfra and Deepgram issue keys with no telltale prefix. They are
 // caught by the name beside them - generic_key (any *_API_KEY=… or "api key": …),
-// bearer_token, dot_env_content. A bare high-entropy blob with no name next to it is
-// deliberately not matched: no rule tells it from ordinary text, and redacting the
-// model's own answers costs more than that miss.
+// bearer_token, dot_env_content. An unknown bare blob has no shape rule; known installation values are
+// matched by the shared secret-redaction package below.
 // The custom provider (MODEL_PROVIDER=custom) is exactly that case and has no pattern
 // here on purpose: the endpoint is the owner's, so its key can look like anything, and
 // a rule invented for it would either miss or redact ordinary text. CUSTOM_API_KEY is
@@ -575,8 +578,21 @@ const INJECTION_ARTIFACTS: readonly Pattern[] = [
 const REDACTED = "[REDACTED]";
 
 export function scanOutbound(input: string, redact = true): OutboundResult {
-  let text = input;
   const findings: OutboundFinding[] = [];
+  const values = secretEntriesFromEnv(process.env, secretKeyInventory).map(
+    ({ value }) => value,
+  );
+  // Values precede shapes: a shape can otherwise cut a prefix and leave the credential's tail.
+  const valueText = redactSecretValues(input, values);
+  const secretText =
+    valueText === input ? input : valueText.replaceAll("<redacted>", REDACTED);
+  let text = redact ? secretText : input;
+  if (secretText !== input)
+    findings.push({
+      type: "api_key",
+      name: "installation_secret",
+      preview: REDACTED,
+    });
   const groups: ReadonlyArray<
     readonly [type: string, patterns: readonly Pattern[]]
   > = [
@@ -586,7 +602,7 @@ export function scanOutbound(input: string, redact = true): OutboundResult {
   ];
   for (const [type, patterns] of groups) {
     for (const [name, re] of patterns) {
-      const matches = input.match(re);
+      const matches = secretText.match(re);
       if (!matches) continue;
       for (const match of matches) {
         findings.push({ type, name, preview: match.slice(0, 12) + "…" });

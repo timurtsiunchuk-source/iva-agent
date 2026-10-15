@@ -19,6 +19,8 @@ import {
   alertDue,
   alertOnce,
   alertResolved,
+  CUSTOM_ALERT_KEY,
+  customStockAlert,
   deliverMemoryReport,
   memoryReportTail,
   memoryReportsEnabled,
@@ -30,6 +32,9 @@ import {
   rollupRanBefore,
   settleReportsOffNotice,
   updateAlertState,
+  USERBOT_ALERT_KEY,
+  userbotOffAlert,
+  userbotOffReason,
   type ReportsOffNotice,
   type Translate,
 } from "./notice-policy.ts";
@@ -97,6 +102,77 @@ test("the report tail names the language and forbids self-delivery", () => {
 });
 
 // ── Notice: язык берётся у резолвера, без дерева — у env ──────────────────────────────────
+test("the stock-build Alert says what broke, that the files are safe and what to do", () => {
+  const line = "error TS1005: ';' expected.";
+  const en = customStockAlert(EN, line);
+  const ru = customStockAlert(RU, line);
+  assert.equal(
+    en,
+    "Iva is running the stock build: your files in data/custom do not build with this version — error TS1005: ';' expected. The files are untouched; fix them and the next `iva update` puts them back.",
+  );
+  assert.equal(
+    ru,
+    "Ива работает на заводской сборке: ваши файлы в data/custom не собрались с этой версией — error TS1005: ';' expected. Файлы на месте; поправьте их, и следующее `iva update` поставит их снова.",
+  );
+  assert.match(
+    customStockAlert(EN, null),
+    /— last time the version carrying them did not come up\./u,
+  );
+  assert.match(
+    customStockAlert(RU, null),
+    /— в прошлый раз версия с ними не поднялась\./u,
+  );
+  // Слова Avoid из CONTEXT.md не идут владельцу.
+  for (const text of [
+    en,
+    ru,
+    customStockAlert(EN, null),
+    customStockAlert(RU, null),
+  ])
+    assert.doesNotMatch(
+      text,
+      /билд|кастомизаци|digest|retry|warning|override|лимит/iu,
+    );
+  assert.equal(CUSTOM_ALERT_KEY, "custom-build");
+});
+
+// Обновление выключило юзербот (#273): кто обновлялся кнопкой в боте, вывода апдейта не видит.
+// Причина остаётся в выводе `iva update`: её коды и чужие фразы владельцу в чат не идут.
+test("the userbot Alert says it is off, what that costs and where to turn it back on", () => {
+  assert.equal(
+    userbotOffAlert(RU),
+    "⚠️ Ива выключила юзербот: после обновления он не запустился. Пока он выключен, Ива не читает и не ищет ваши чаты от вашего аккаунта; остальное работает как раньше. Включить обратно: /menu → 📡 Userbot → «Включить».",
+  );
+  assert.equal(
+    userbotOffAlert(EN),
+    "⚠️ Iva switched the userbot off: it did not come up after the update. While it is off, Iva cannot read or search your chats as your account; everything else works as before. Turn it back on: /menu → 📡 Userbot → «Turn on».",
+  );
+  // Слова Avoid из CONTEXT.md не идут владельцу.
+  for (const tr of [EN, RU])
+    assert.doesNotMatch(
+      userbotOffAlert(tr),
+      /билд|кастомизаци|digest|retry|warning|override|лимит|ошибк|bridge|gateway|демон|воркер|sidecar|notification|пуш/iu,
+    );
+  assert.equal(USERBOT_ALERT_KEY, "userbot-off");
+});
+
+// Суть Alert для дросселя — причина одной строкой: та же причина в другой обёртке не говорит
+// дважды. Что никакая причина не доходит до чата — scripts/update-finish.test.ts.
+test("the userbot Alert's essence is any reason on one line (seed 20261010)", () => {
+  const reason =
+    "userbot: зависимости не импортируются — ModuleNotFoundError: telegram_mcp.";
+  assert.equal(userbotOffReason("userbot: a\n  b.\n"), "a b");
+  assert.equal(userbotOffReason(reason), userbotOffReason(`${reason}\n`));
+  fc.assert(
+    fc.property(fc.string({ maxLength: 80 }), (raw) => {
+      const why = userbotOffReason(raw);
+      assert.doesNotMatch(why, /\s{2}|^\s|\s$|\n/u);
+      assert.doesNotMatch(why, /^userbot:|\.$/u);
+    }),
+    { seed: 20261010, numRuns: 200 },
+  );
+});
+
 test("notice language comes from the tree, and falls back to the env without it", async () => {
   const broken = () => Promise.reject(new Error("no authored tree"));
   assert.equal(await noticeLang({}, broken), "ru");

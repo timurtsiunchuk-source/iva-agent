@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
-  acknowledgeQueueHead,
+  acknowledgeQueueItems,
   enqueueQueueFile,
   isTelegramQueueUpdate,
   loadQueueFile,
@@ -217,8 +217,8 @@ export async function promoteReadyInbox({
   loadImpl = async () =>
     (await loadQueueFile(TELEGRAM_INBOX_FILE, { strict: true })).document,
   routeImpl = routeMessageUpdate,
-  acknowledgeImpl = (key: string, updateId: number) =>
-    acknowledgeQueueHead(TELEGRAM_INBOX_FILE, key, updateId, { strict: true }),
+  acknowledgeImpl = (key: string, ids: readonly number[]) =>
+    acknowledgeQueueItems(TELEGRAM_INBOX_FILE, key, ids, { strict: true }),
   backoff = inboxPromotionBackoff,
 }: {
   now?: () => number;
@@ -227,7 +227,7 @@ export async function promoteReadyInbox({
     Awaited<ReturnType<typeof loadQueueFile>>["document"]
   >;
   routeImpl?: (update: TelegramQueueUpdate) => Promise<RouteMessageResult>;
-  acknowledgeImpl?: (key: string, updateId: number) => Promise<unknown>;
+  acknowledgeImpl?: (key: string, ids: readonly number[]) => Promise<unknown>;
   backoff?: Map<string, InboxPromotionBackoff>;
 } = {}): Promise<number> {
   const snapshot = await loadImpl();
@@ -257,9 +257,8 @@ export async function promoteReadyInbox({
       continue;
     }
     backoff.delete(key);
-    for (const updateId of batch.updateIds) {
-      await acknowledgeImpl(key, updateId);
-    }
+    // Одна запись: остаток пачки после обрыва несёт её update_id и закрыл бы её целиком.
+    await acknowledgeImpl(key, batch.updateIds);
   }
   const remaining = await loadImpl();
   return queueKeys(remaining).reduce(

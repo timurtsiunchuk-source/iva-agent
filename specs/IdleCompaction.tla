@@ -12,16 +12,20 @@
 \*   Send         a person writes; a reply to a bot message is its own kind (Bypass)
 \*   Route        scripts/poller/routing.ts:212 routeMessageUpdate: a reply to the bot skips
 \*                the busy check unless the chat is compacting (:292, isCompacting
-\*                agent/lib/run-status.ts:283); mustQueue (:295) when the policy is queue and
-\*                isRunning (run-status.ts:274, one RUN_STALE_MS for turn and compaction) or the
-\*                disk queue / a drain is busy -> enqueue + notice (scripts/poller/queue.ts:1092
-\*                queuedNoticeText); else a direct delivery
-\*   Drain        routing.ts:335 drainReadyQueueHeads: the queue head while not running
-\*   Arrive       onAccepted (agent/channels/telegram.ts:491) -> publishTelegramEarlyStatus ->
-\*                takeOverTelegramChat (agent/lib/telegram-turn-start.ts:192): a fresh running
-\*                record is left alone, any other is taken with chatTakeOverPatch (:100,
-\*                compacting: null, resetAt: null); then eve's inbound: queue -> input buffer
-\*                (Ф4); steer during a compaction -> abort (Ф5), during a turn -> joins it
+\*                agent/lib/run-status.ts:283); mustQueue (:295, route R1 of
+\*                .scratch/work/wave-1010/l5/spec-v2.md §3.4) when the disk queue / a drain is
+\*                busy under either policy, or the policy is queue and isRunning (run-status.ts:274,
+\*                one RUN_STALE_MS for turn and compaction) -> enqueue + notice
+\*                (scripts/poller/queue.ts:1092 queuedNoticeText); else a direct delivery
+\*   Drain        routing.ts:335 drainReadyQueueHeads while not running: the queue holds a batch
+\*                of k >= 1 items from its head, delivered at once (spec-v2 §3.3)
+\*   Arrive       onAccepted (agent/channels/telegram.ts) -> publishTelegramEarlyStatus ->
+\*                claimChat (agent/lib/telegram-turn-start.ts): a fresh running record keeps
+\*                its owner; any other record is taken with chatTakeOverPatch
+\*                (compacting: null, resetAt: null); then
+\*                eve's inbound: queue -> input buffer (Ф4); steer during a compaction ->
+\*                abort (Ф5), during a turn -> joins it (eve cancels the turn and starts one
+\*                with the message: folded into the turn here)
 \*   EveStartComp eve parked takes control commands before buffered messages (Ф11); a
 \*                compaction first emits compaction.requested: state compReq until the hook ran
 \*   BeginHook    compaction.requested hook (agent/hooks/usage.ts:101) -> beginIdleCompaction
@@ -30,9 +34,9 @@
 \*                live record or resetAt is left alone); BeginAnyIdle (R5, not code): claim for
 \*                any compaction outside a turn, memory or not
 \*   EveStartTurn turn.started (telegram.ts:296): openIdleCompactionTurn (idle-compaction.ts:49)
-\*                + publishTelegramTurnStarted (turn-start.ts:337): adopt an ingress record
-\*                (:414), skip on resetAt (:369), else a generation CAS writing compacting: null
-\*                (:379)
+\*                + publishTelegramTurnStarted (turn-start.ts): adopt an ingress record
+\*                (adoptEarlyStatus), skip on resetAt, else a generation CAS writing
+\*                compacting: null (claimTurnStatus). Eve's input buffer goes into one turn
 \*   Step         step.completed hook (usage.ts:87) -> recordStepInput (idle-compaction.ts:72),
 \*                first KNOWN input (first ??= tokens)
 \*   InTurnComp   eve's own safety compaction inside a turn: compaction.requested and
@@ -69,13 +73,14 @@
 \*   Expire       a running record goes stale after RUN_STALE_MS when nobody owns it any more;
 \*                with LongCompaction also a compacting record (no heartbeat) while eve still
 \*                compacts
-\*   Reap         queue.ts:973 reapStaleRuns: idle + resetAt, reset of the session, notice
-\*                «Предыдущий ход оборвался» unless compacting (:952 notifyInterruptedTurn)
+\*   Reap         queue.ts reapStaleRuns: idle + resetAt, reset of the session, notice
+\*                «Предыдущий ход оборвался» unless compacting (notifyInterruptedTurn)
 \*   Restart      process killed: module memory and the POST are gone; ExecStartPre
 \*                recoverInterruptedSessionState (scripts/lib/wf-store.ts:190): a running record
 \*                not yet marked (:89) -> quarantine of the workflow store (session, input,
 \*                controls gone); rewriteRunStatusesForUpdate (:153): a compacting record becomes
-\*                idle + resetAt (:167), any other running record updatedAt = 0 for the reaper;
+\*                idle + resetAt (:167); any
+\*                other running record updatedAt = 0 for the reaper;
 \*                no running record -> the store (with its queued controls) stays and a session
 \*                killed in a compaction or a turn hangs (Ф8, specs/RestartRecovery.tla)
 \*
@@ -221,7 +226,7 @@ Send ==
 
 RouteMsg(reply) ==
   LET busyCheck == ~reply \/ (QueueReplies /\ CompRecord /\ fresh)
-      mustQueue == busyCheck /\ Policy = "queue" /\ (Running \/ bq > 0 \/ dw > 0)
+      mustQueue == busyCheck /\ ((Policy = "queue" /\ Running) \/ bq > 0 \/ dw > 0)
   IN /\ IF mustQueue
           THEN bq' = bq + 1 /\ UNCHANGED wire
           ELSE wire' = wire + 1 /\ UNCHANGED bq
@@ -240,24 +245,24 @@ Route ==
 
 Drain ==
   /\ bq > 0 /\ dw = 0 /\ ~Running
-  /\ bq' = bq - 1 /\ dw' = 1
+  /\ \E k \in 1..bq : bq' = bq - k /\ dw' = k
   /\ UNCHANGED <<sent, pend, pendR, wire>>
   /\ UNCHANGED <<eveV, postV, recV, memV, lossV, ghostV>>
 
-Arrive ==
-  /\ \/ dw > 0 /\ dw' = 0 /\ UNCHANGED wire
-     \/ wire > 0 /\ wire' = wire - 1 /\ UNCHANGED dw
+\* n messages reach eve with one delivery: a drained batch (all of dw at once) or one direct
+\* message from the wire.
+Land(n) ==
   /\ IF Running
        THEN UNCHANGED recV
        ELSE /\ rs' = "running" /\ rk' = "ingress" /\ rsid' = "none" /\ cflag' = FALSE
             /\ fresh' = TRUE /\ resetAt' = FALSE /\ marked' = FALSE
   /\ IF hung
-       THEN buf' = buf + 1 /\ UNCHANGED <<started, ev>>
+       THEN buf' = buf + n /\ UNCHANGED <<started, ev>>
        ELSE IF Policy = "steer" /\ Compacting
-       THEN buf' = buf + 1 /\ ev' = "postAbort" /\ UNCHANGED started
+       THEN buf' = buf + n /\ ev' = "postAbort" /\ UNCHANGED started
        ELSE IF Policy = "steer" /\ ev = "turn"
-       THEN started' = started + 1 /\ UNCHANGED <<buf, ev>>
-       ELSE buf' = buf + 1 /\ UNCHANGED <<started, ev>>
+       THEN started' = started + n /\ UNCHANGED <<buf, ev>>
+       ELSE buf' = buf + n /\ UNCHANGED <<started, ev>>
   \* (1, strong form) under queue no message enters eve's input while the compacting record
   \* holds the chat
   /\ inboxLeak' = (inboxLeak \/ (Policy = "queue" /\ CompRecord /\ fresh /\ ~hung))
@@ -265,6 +270,10 @@ Arrive ==
   /\ UNCHANGED <<after, steps, ctx, ctrl, hung, stops>> /\ UNCHANGED <<postV, memV, lossV>>
   /\ UNCHANGED <<asksSince, badStack, badStackRec, badAskOff, idleDone, turnClean, badOff,
                  falseNotice, leak, hangSeen, hangTurn, badCancelMark, expired, leakWin, hangWin>>
+
+Arrive ==
+  \/ dw > 0 /\ dw' = 0 /\ UNCHANGED wire /\ Land(dw)
+  \/ wire > 0 /\ wire' = wire - 1 /\ UNCHANGED dw /\ Land(1)
 
 EveStartComp ==
   /\ ev = "parked" /\ ~hung /\ ctrl > 0
@@ -560,7 +569,7 @@ Spec == Init /\ [][Next]_vars
 
 TypeOK ==
   /\ sent \in 0..MaxMsgs /\ pend \in 0..MaxMsgs /\ pendR \in 0..MaxMsgs /\ bq \in 0..MaxMsgs
-  /\ wire \in 0..MaxMsgs /\ dw \in 0..1 /\ buf \in 0..MaxMsgs /\ started \in 0..MaxMsgs
+  /\ wire \in 0..MaxMsgs /\ dw \in 0..MaxMsgs /\ buf \in 0..MaxMsgs /\ started \in 0..MaxMsgs
   /\ ev \in {"parked", "turn", "compReq", "compact", "postTurn", "postComp", "postAbort", "waitClaim",
              "waitPost", "cancelH"}
   /\ after \in {"parked", "cancelH"}
@@ -618,4 +627,5 @@ NoAskOverCompactingRecord == ~badStackRec
 
 \* (7) no ask while off (process memory).
 NoAskWhileOff == ~badAskOff
+
 ====

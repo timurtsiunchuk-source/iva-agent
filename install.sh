@@ -31,7 +31,6 @@ if [ "${IVA_BETA:-}" = 1 ]; then
 fi
 BRANCH="${BRANCH:-main}"
 UPDATE_CHANNEL="$BRANCH"
-INSTALL_DIR="${INSTALL_DIR:-$HOME/iva}"
 NODE_MAJOR_MIN=24
 UV_INSTALLER_URL="https://github.com/astral-sh/uv/releases/download/0.12.5/uv-installer.sh"
 UV_INSTALLER_SHA256="504511fbbbd811aeaba6738abc79408956b6c7da0ca35437b3dcc24a41efc111"
@@ -129,6 +128,16 @@ install_verified_npm_tarball() {
   cleanup_verified_download
   return "$rc"
 }
+
+# Internal updater entry: exactly the same pins, download and checksum as installation.
+# Runs before setup, repository discovery, units or service changes.
+if [ "${1:-}" = --update-gws ]; then
+  [ "$#" -eq 2 ] || exit 2
+  install_verified_npm_tarball gws "$GWS_TARBALL_URL" "$GWS_TARBALL_SHA256" --prefix "$2"
+  exit "$?"
+fi
+
+INSTALL_DIR="${INSTALL_DIR:-$HOME/iva}"
 
 # Compact progress for automatic work. Prompts, sudo and the setup wizard never
 # run behind a spinner, so they remain fully readable and interactive.
@@ -935,34 +944,20 @@ cd "$PROJECT_DIR"
 # ─────────────────────────────────────────────────────────────────────────
 # npm records what it installed in node_modules/.package-lock.json, so the answer comes
 # from npm's own bookkeeping, not from a marker of ours: every entry it lists must be in
-# package-lock.json at the same version, and every entry the lockfile requires on this
+# package-lock.json with the same version, resolved URL and integrity, and every entry required on this
 # platform must be there. Optional and os/cpu-specific packages are absent by design.
 npm_deps_match_lock() {
   [ -d node_modules ] || return 1
   [ -f package-lock.json ] || return 1
   [ -f node_modules/.package-lock.json ] || return 1
-  node -e 'const fs=require("fs");const j=p=>JSON.parse(fs.readFileSync(p,"utf8"));const lock=j("package-lock.json"),have=j("node_modules/.package-lock.json");const a=lock.packages||{},b=have.packages||{};if(!Object.keys(b).length)process.exit(1);for(const k of Object.keys(b)){if(!k)continue;if(!a[k]||a[k].version!==b[k].version)process.exit(1)}for(const k of Object.keys(a)){if(!k)continue;const e=a[k];if(e.optional||e.devOptional||e.os||e.cpu)continue;if(!b[k])process.exit(1)}' \
+  node -e 'const fs=require("fs");const j=p=>JSON.parse(fs.readFileSync(p,"utf8"));const lock=j("package-lock.json"),have=j("node_modules/.package-lock.json");const a=lock.packages||{},b=have.packages||{};if(!Object.keys(b).length)process.exit(1);for(const k of Object.keys(b)){if(!k)continue;if(!a[k]||["version","resolved","integrity"].some(f=>a[k][f]!==b[k][f]))process.exit(1)}for(const k of Object.keys(a)){if(!k)continue;const e=a[k];if(e.optional||e.devOptional||e.os||e.cpu)continue;if(!b[k])process.exit(1)}' \
     >/dev/null 2>&1
 }
 CURRENT_STEP="$(t "dependencies" "зависимости")"
 INSTALL_DEPS_REUSED=false
 if npm_deps_match_lock; then
-  # The lockfile says nothing about patches/, which npm's postinstall hook applies on top
-  # of the installed tree, so re-apply them: it is the one thing a skipped `npm ci` would
-  # leave stale, and it takes under a second. The binary is called the way the hook calls
-  # it — straight out of node_modules — so nothing here can reach for the registry.
-  # There are patches but nothing to apply them with (a pruned node_modules) means the
-  # installed tree cannot be trusted: fall through to a full install rather than call it
-  # reused with the patches missing.
-  if [ ! -d patches ]; then
-    INSTALL_DEPS_REUSED=true
-  elif [ -x node_modules/.bin/patch-package ] \
-    && node_modules/.bin/patch-package >>"$INSTALL_LOG" 2>&1; then
-    INSTALL_DEPS_REUSED=true
-  fi
-  if [ "$INSTALL_DEPS_REUSED" = true ]; then
-    ok "$(t "Dependencies already match package-lock.json" "Зависимости уже соответствуют package-lock.json")"
-  fi
+  INSTALL_DEPS_REUSED=true
+  ok "$(t "Dependencies already match package-lock.json" "Зависимости уже соответствуют package-lock.json")"
 fi
 if [ "$INSTALL_DEPS_REUSED" != true ]; then
   if [ -f package-lock.json ]; then

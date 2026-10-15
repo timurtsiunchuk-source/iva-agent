@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import {
-  acknowledgeQueueHead,
+  acknowledgeQueueItems,
   clearQueueFileKey,
   enqueueQueueFile,
   loadQueueFile,
@@ -27,6 +27,7 @@ import {
   listChatStatuses,
   chatKeyOf,
   parseTelegramSessionRetirement,
+  QUEUED_STATUS_CLEARED,
   RUN_STALE_MS,
   setChatStatus,
   setChatStatusIf,
@@ -48,7 +49,6 @@ type RunStatus = Record<string, unknown> & {
   sessionId?: unknown;
   ingressId?: unknown;
   ingressAt?: unknown;
-  statusMessageId?: unknown;
 };
 type ResetResult = { status?: unknown; [key: string]: unknown };
 type ResetRequest = { chatKey: string; target: TelegramResetTarget };
@@ -94,13 +94,15 @@ const withResetFailures = (error: unknown, resetFailures: number) => {
 
 // ── Durable busy-time FIFO ──────────────────────────────────────────────────
 // Each accepted Telegram update is written as a versioned item (including update_id and
-// the untouched raw update) before its Telegram offset advances. The bridge then replays
-// one head per idle chat/topic. It removes that head only after Eve accepts the webhook:
-// a crash can duplicate the head, but cannot lose it or reorder later items around it.
+// the untouched raw update) before its Telegram offset advances. The Bridge then replays
+// one batch (consecutive messages of one author) per idle chat/topic. It removes that batch
+// only after Eve accepts it: a crash can duplicate the batch, never lose or reorder it.
 const QUEUE_FILE = join(DATA_DIR, "telegram-queue.json");
 const RESET_INTENT_DIR = join(DATA_DIR, "telegram-reset-intents");
 const queueSettleUntil = new Map<string, number>();
 const queueInFlight = new Map<string, QueuePhase>();
+// Ids of a delivered batch until its removal is durable: every redelivery carries exactly them.
+const queueBatchPins = new Map<string, readonly number[]>();
 const queueDrainRotation: { afterKey: string | null } = { afterKey: null };
 const undrainableLegacyLogged = new Set<string>();
 // Remove this backoff when vercel/eve#2876 is fixed in the installed eve.
@@ -279,13 +281,33 @@ export const enqueueTelegramQueueUpdate = (
     enqueueImpl(QUEUE_FILE, chatKey, update, { strict: true }),
   );
 
-export const acknowledgeTelegramQueueHead = (
+export const acknowledgeTelegramQueueItems = (
   chatKey: string,
-  updateId: number,
+  updateIds: readonly number[],
 ) =>
   serializeQueueMutation(() =>
-    acknowledgeQueueHead(QUEUE_FILE, chatKey, updateId),
+    acknowledgeQueueItems(QUEUE_FILE, chatKey, updateIds),
   );
+
+const deleteLegacyMessage = (chatKey: string, messageId: string | number) =>
+  tg("deleteMessage", {
+    chat_id: chatKey.split(":")[0],
+    message_id: messageId,
+  });
+
+async function deleteLegacyStatusMessages(
+  chatKey: string,
+  status: Record<string, unknown> | null,
+  deleteMessageImpl: typeof deleteLegacyMessage,
+): Promise<void> {
+  for (const id of new Set([
+    status?.statusMessageId,
+    status?.queuedStatusMessageId,
+  ])) {
+    if (typeof id === "string" || typeof id === "number")
+      await deleteMessageImpl(chatKey, id).catch(() => {});
+  }
+}
 
 export async function completeScopedResetState(
   chatKey: string,
@@ -295,7 +317,7 @@ export async function completeScopedResetState(
     resetRequestedAt,
     clearQueueImpl = clearChatQueue,
     setStatusImpl = setChatStatus,
-    deleteMessageImpl = deleteStaleWorkingMessage,
+    deleteMessageImpl = deleteLegacyMessage,
   }: {
     clearQueue?: boolean;
     discardThroughUpdateId?: number;
@@ -309,10 +331,7 @@ export async function completeScopedResetState(
       chatKey: string,
       patch: Record<string, unknown>,
     ) => unknown;
-    deleteMessageImpl?: (
-      chatKey: string,
-      messageId: string | number,
-    ) => unknown;
+    deleteMessageImpl?: typeof deleteLegacyMessage;
   } = {},
 ) {
   // For private chats the queue belongs to the reset session, so clear it
@@ -322,43 +341,24 @@ export async function completeScopedResetState(
     await clearQueueImpl(chatKey, discardThroughUpdateId, resetRequestedAt);
   }
 
-  // /new clears sessionId before a late terminal event can finish the Working…
-  // message, so delete it here from the pre-reset snapshot.
-  const current = getChatStatus(chatKey);
-
-  // Delete before clearing state: a crash after delete is harmless (message
-  // already gone); a crash before either step still leaves state pointing at
-  // the message for the next /new attempt.
-  if (
-    current?.statusMessageId !== undefined &&
-    current.statusMessageId !== null
-  ) {
-    try {
-      await deleteMessageImpl(
-        chatKey,
-        current.statusMessageId as string | number,
-      );
-    } catch {
-      // Reset working messages are removed best-effort, like stale ones.
-    }
-  }
-
+  const previous = getChatStatus(chatKey);
   setStatusImpl(chatKey, {
     status: "idle",
     sessionId: null,
     turnId: null,
-    statusMessageId: null,
+    draftId: null,
     ingressId: null,
     ingressAt: null,
-    statusAt: null,
     turnAt: null,
     firstOutputAt: null,
     latencyLogged: null,
     wasCancelled: null,
     compacting: null,
     retiredSessionId: null,
+    ...QUEUED_STATUS_CLEARED,
     resetAt: Date.now(),
   });
+  await deleteLegacyStatusMessages(chatKey, previous, deleteMessageImpl);
 }
 
 export async function persistPrivateResetIntent(
@@ -674,36 +674,19 @@ async function sendStaleRunNotice(chatKey: string, text: string) {
     );
 }
 
-async function deleteStaleWorkingMessage(
-  chatKey: string,
-  messageId: string | number,
-) {
-  const target = telegramTargetOf(chatKey);
-  if (!target) return;
-  await tg("deleteMessage", {
-    chat_id: target.chat_id,
-    message_id: messageId,
-  });
-}
-
-async function clearFailedDirectIngress(
+function clearFailedDirectIngress(
   chatKey: string,
   {
     baselineGeneration,
     startedAt,
     statusImpl = getChatStatus,
     setStatusIfImpl = setChatStatusIf,
-    deleteMessageImpl = deleteStaleWorkingMessage,
     now = Date.now,
   }: {
     baselineGeneration: number;
     startedAt: number;
     statusImpl?: StatusImpl;
     setStatusIfImpl?: SetStatusIfImpl;
-    deleteMessageImpl?: (
-      chatKey: string,
-      messageId: string | number,
-    ) => unknown;
     now?: () => number;
   },
 ) {
@@ -719,7 +702,7 @@ async function clearFailedDirectIngress(
     current.ingressAt > observedAt ||
     statusGeneration(current) <= baselineGeneration
   ) {
-    return false;
+    return Promise.resolve(false);
   }
 
   const cleared = setStatusIfImpl(
@@ -735,34 +718,21 @@ async function clearFailedDirectIngress(
       status: "idle",
       sessionId: null,
       turnId: null,
-      statusMessageId: null,
+      draftId: null,
       ingressId: null,
       ingressAt: null,
-      statusAt: null,
       turnAt: null,
       firstOutputAt: null,
       latencyLogged: null,
       wasCancelled: null,
       compacting: null,
+      ...QUEUED_STATUS_CLEARED,
       resetAt: observedAt,
     },
   );
-  if (!cleared) return false;
+  if (!cleared) return Promise.resolve(false);
 
-  if (
-    current.statusMessageId !== undefined &&
-    current.statusMessageId !== null
-  ) {
-    try {
-      await deleteMessageImpl(
-        chatKey,
-        current.statusMessageId as string | number,
-      );
-    } catch {
-      // Failed-attempt working messages are removed best-effort, like stale ones.
-    }
-  }
-  return true;
+  return Promise.resolve(true);
 }
 
 function sameRetirement(
@@ -975,7 +945,7 @@ export async function reapStaleRuns({
   setStatusIfImpl = setChatStatusIf,
   resetImpl = releaseScopedSession,
   sendImpl = sendStaleRunNotice,
-  deleteMessageImpl = deleteStaleWorkingMessage,
+  deleteMessageImpl = deleteLegacyMessage,
   now = Date.now,
   inFlight = queueInFlight,
   staleMs = RUN_STALE_MS,
@@ -1043,15 +1013,15 @@ export async function reapStaleRuns({
           status: "idle",
           sessionId: null,
           turnId: null,
-          statusMessageId: null,
+          draftId: null,
           ingressId: null,
           ingressAt: null,
-          statusAt: null,
           turnAt: null,
           firstOutputAt: null,
           latencyLogged: null,
           wasCancelled: null,
           compacting: null,
+          ...QUEUED_STATUS_CLEARED,
           resetAt: reapedAt,
         },
       );
@@ -1061,6 +1031,7 @@ export async function reapStaleRuns({
     }
     if (!flipped) continue;
     reaped++;
+    await deleteLegacyStatusMessages(key, status, deleteMessageImpl);
 
     if (typeof status.sessionId === "string" && status.sessionId.length > 0) {
       try {
@@ -1073,17 +1044,6 @@ export async function reapStaleRuns({
     }
 
     await notifyInterruptedTurn(key, status, sendImpl, trImpl, safeLog);
-
-    if (
-      status.statusMessageId !== undefined &&
-      status.statusMessageId !== null
-    ) {
-      try {
-        await deleteMessageImpl(key, status.statusMessageId as string | number);
-      } catch {
-        // Старое статус-сообщение удаляется best-effort.
-      }
-    }
   }
   return reaped;
 }
@@ -1132,11 +1092,11 @@ export {
   QUEUE_FILE,
   queueSettleUntil,
   queueInFlight,
+  queueBatchPins,
   queueDrainRotation,
   undrainableLegacyLogged,
   statusGeneration,
   sendStaleRunNotice,
-  deleteStaleWorkingMessage,
   clearFailedDirectIngress,
   acknowledgeQueued,
   QUEUE_DELIVERY_TIMEOUT_MS,

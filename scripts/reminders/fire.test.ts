@@ -195,6 +195,8 @@ void test("ход выполнил напоминание: его ответ у�
   assert.match(prompts[0], /r1/u);
   assert.match(prompts[0], /позвонить в клинику/u);
   assert.match(prompts[0], /final text of this turn/u);
+  assert.match(prompts[0], /background-check skill/u);
+  assert.match(prompts[0], /instead of waiting for the job to finish/u);
   assert.equal(calls.length, 1, "отправка ровно одна");
   assert.equal(calls[0].chat, chat.id);
   assert.equal(calls[0].threadId, chat.threadId);
@@ -321,7 +323,7 @@ void test("занятый чат: живой ход владельца оста�
     sessionId: "owner-sess",
     turnId: "owner-turn",
     ingressId: "ing-1",
-    statusMessageId: 42,
+    draftId: 42,
   });
   const during: unknown[] = [];
   const runTurn = realTurn(completed, {
@@ -451,7 +453,7 @@ void test("протухшая запись владельца: напомина�
     status: "running",
     sessionId: "owner-sess",
     turnId: "owner-turn",
-    statusMessageId: 42,
+    draftId: 42,
     retireAfterTurn: {
       replayMs: 1,
       sessionId: "owner-sess",
@@ -484,13 +486,9 @@ void test("протухшая запись владельца: напомина�
     "протухшую запись напоминание забирает себе",
   );
   assert.equal(
-    during[0]?.statusMessageId,
+    during[0]?.draftId,
     undefined,
     "осиротевший индикатор с записи снят: после захвата его больше никто не найдёт",
-  );
-  assert.ok(
-    lines.some((line) => /working status 42 of a dead turn stays/u.test(line)),
-    lines.join("\n"),
   );
   assert.equal(isRunning(key), false, "после хода запись снята");
   assert.equal(calls[0].text, "готово", "ответ владельцу всё равно доехал");

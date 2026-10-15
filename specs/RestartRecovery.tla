@@ -10,15 +10,21 @@
 \* отказ восстановления не даёт сервису стартовать. Fixed = TRUE — поведение после ремонта.
 EXTENDS Naturals
 
-CONSTANTS MaxMsgs, MaxCrashes, MaxFaults, Keep, Fixed
+CONSTANTS MaxMsgs, MaxCrashes, MaxFaults, Keep, Fixed, RecoveryCAS
 
 VARIABLES proc, turn, lock, status, queue, sent, answered, noticed,
           crashes, faults, interrupted, quarantines, origKept, blocked
+
+VARIABLES recoveryPhase, diskStatus, diskGeneration, scanGeneration, checkedGeneration, checkedStatus, statusLock, bridgeDone, newTurn
+recoveryVars == <<recoveryPhase, diskStatus, diskGeneration, scanGeneration, checkedGeneration, checkedStatus, statusLock, bridgeDone, newTurn>>
 
 vars == <<proc, turn, lock, status, queue, sent, answered, noticed,
           crashes, faults, interrupted, quarantines, origKept, blocked>>
 
 Init ==
+  /\ recoveryPhase = "idle" /\ diskStatus = "running" /\ diskGeneration = 1
+  /\ scanGeneration = 0 /\ checkedGeneration = 0 /\ checkedStatus = "none"
+  /\ statusLock = FALSE /\ bridgeDone = FALSE /\ newTurn = FALSE
   /\ proc = "up" /\ turn = FALSE /\ lock = FALSE /\ status = "none"
   /\ queue = 0 /\ sent = 0 /\ answered = 0 /\ noticed = 0
   /\ crashes = 0 /\ faults = 0 /\ interrupted = 0
@@ -99,9 +105,48 @@ Notice ==
   /\ UNCHANGED <<proc, turn, queue, sent, answered, crashes, faults,
                  interrupted, quarantines, origKept, blocked>>
 
-Next ==
+LegacyNext ==
   \/ Send \/ StartTurn \/ FinishTurn \/ Crash \/ Boot
   \/ Quarantine \/ MarkStale \/ Fault \/ Start \/ Notice
+
+Next == LegacyNext /\ UNCHANGED recoveryVars
+
+\* H2: scan -> repeated read -> publication, with Bridge closing the same chat.
+\* RecoveryCAS uses the same per-chat lock and generation comparison as writers.
+RecoveryScan ==
+  /\ recoveryPhase = "idle"
+  /\ recoveryPhase' = "scanned" /\ scanGeneration' = diskGeneration
+  /\ UNCHANGED <<diskStatus, diskGeneration, checkedGeneration, checkedStatus, statusLock, bridgeDone, newTurn>>
+RecoveryRead ==
+  /\ recoveryPhase = "scanned" /\ ~statusLock
+  /\ recoveryPhase' = "checked" /\ checkedGeneration' = diskGeneration
+  /\ checkedStatus' = diskStatus
+  /\ statusLock' = RecoveryCAS
+  /\ UNCHANGED <<diskStatus, diskGeneration, scanGeneration, bridgeDone, newTurn>>
+BridgeFinish ==
+  /\ ~statusLock /\ ~bridgeDone
+  /\ diskStatus' = "idle" /\ diskGeneration' = diskGeneration + 1 /\ bridgeDone' = TRUE
+  /\ UNCHANGED <<recoveryPhase, scanGeneration, checkedGeneration, checkedStatus, statusLock, newTurn>>
+BridgeStart ==
+  /\ bridgeDone /\ ~newTurn /\ ~statusLock /\ recoveryPhase \in {"scanned", "checked"}
+  /\ newTurn' = TRUE /\ diskStatus' = "running" /\ diskGeneration' = diskGeneration + 1
+  /\ UNCHANGED <<recoveryPhase, scanGeneration, checkedGeneration, checkedStatus, statusLock, bridgeDone>>
+RecoveryPublish ==
+  /\ recoveryPhase = "checked"
+  /\ recoveryPhase' = "done" /\ statusLock' = FALSE
+  \* Publication uses the locked READ snapshot, as the code does. There is no
+  \* atomic last-minute disk-status check hiding a missing/early-released lock.
+  /\ IF checkedStatus = "running" /\ scanGeneration = checkedGeneration
+       THEN /\ diskStatus' = "stale"
+            /\ diskGeneration' = checkedGeneration + 1
+       ELSE UNCHANGED <<diskStatus, diskGeneration>>
+  /\ UNCHANGED <<scanGeneration, checkedGeneration, checkedStatus, bridgeDone, newTurn>>
+SecondWindowNext == (RecoveryScan \/ RecoveryRead \/ BridgeFinish \/ BridgeStart \/ RecoveryPublish)
+  /\ UNCHANGED vars
+SecondWindowSpec == Init /\ [][SecondWindowNext]_<<vars, recoveryVars>>
+ClosedStaysClosed == bridgeDone /\ ~newTurn => diskStatus = "idle"
+NewTurnKept == newTurn => diskStatus = "running"
+GenerationAdvances == diskGeneration >= checkedGeneration
 
 Fair ==
   /\ WF_vars(StartTurn) /\ WF_vars(FinishTurn) /\ WF_vars(Boot)

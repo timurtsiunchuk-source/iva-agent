@@ -1,8 +1,8 @@
-# Telegram userbot (beta, opt-in)
+# Telegram userbot (opt-in)
 
-> 🧪 **Beta — expect bugs.** This feature is new and still rough: onboarding steps or tool
-> calls can misbehave. Set it up **at your own risk** and don't lean on it for anything
-> critical yet. Feedback and issues welcome.
+> ⚠️ Automating a personal account is against Telegram's ToS and can get the account limited
+> or banned. The userbot is opt-in and used **at your own risk**; reading is far safer than
+> sending.
 
 ![Your secretary inside Telegram: the userbot reads group chats from your own account, collects summaries and replies as you, with a server-enforced anti-ban guardrail](../assets/iva-userbot.webp)
 
@@ -56,14 +56,31 @@ The health state is one of `off`, `starting`, `unreachable`, `unauthorized` or
 `ready`. CLI and Telegram use the same 1.5-second probe. It checks the existing
 proxy's `/healthz` route, which reads authorization from the proxy's one live
 Telethon client and never opens another session. Diagnostics expose only fixed
-state/reason values; bearer tokens and transport errors are not returned.
+state/reason values; bearer tokens and transport errors are not returned. CLI status and diagnostics also check that the version's Python interpreter can import the proxy dependencies; this import check never opens a Telegram session.
 
-For tool parameter errors, Iva's [userbot skill](../agent/skills/telegram-userbot/SKILL.md)
-instructs it to omit unused optional fields, use actual account labels from `list_accounts`
-when a label is needed, and pass JSON booleans rather than strings. It repairs the named
-field instead of repeating the same failing call. A generic `GEN-ERR-328` response does
-not identify the cause; account discovery and health diagnostics help narrow it down,
-but the skill cannot restore error details hidden by the upstream Telegram MCP server.
+Updates prepare a previously running userbot before bringing it back; `iva restart` does so only when the running proxy does not answer, because re-syncing a ready venv needs the network. Preparation uses the same executable `uv` to create the version's venv and sync `requirements.lock` with hashes. A non-login PATH is supported through the installer's standard `~/.local/bin/uv` location. The proxy is stopped before dependencies change, imports are checked, and the existing authenticated health route must answer within a minute (the proxy connects to Telegram before it listens). `unauthorized` means the proxy is available for QR login, not that Telegram is logged in.
+
+If preparation or readiness fails, Iva's main update remains usable and reports the reason. The userbot is stopped and disabled so a reboot cannot start the broken environment again; after resolving the reported cause, `iva userbot setup` turns it back on. Iva also tells you in Telegram that the update switched the userbot off, with the reason and the /menu button that turns it back on. A previously inactive or absent userbot stays inactive or absent during update. Existing owner tokens, Telegram session and configuration are retained.
+
+Iva's proxy publishes nullable input types for Telegram's optional arguments whose
+source function defaults to `None`, and accepts explicit `null` as that same default.
+Required arguments, nested values and tool output types retain their validation.
+This is local to the Telegram tools; a JSON Schema `default: null` by itself does not
+permit `null` in another MCP server's schema. Existing processes cache tool schemas:
+after upgrading, restart the proxy (`iva userbot setup`) and Iva (`iva restart`).
+
+For parameter errors, Iva's [userbot skill](../agent/skills/telegram-userbot/SKILL.md)
+instructs it to use the tool's schema, omit unused optional fields, and pass JSON
+booleans rather than strings. The proxy also forgives three known slips: the text
+`"null"` in an optional field counts as an omitted field, an account label the model
+made up (`"main"`) goes to the one connected account, and a public `t.me/<name>` link
+in a chat or user id field becomes `@name`. Message text and search queries keep their
+links; invite and `t.me/c/` links are passed on unchanged.
+With several accounts, an unknown account returns a tool error with the available
+labels before Telegram MCP masks it as `GEN-ERR`.
+Use `list_accounts` for actual labels. Omitted accounts keep the upstream single-account
+selection and read-only multi-account fanout. Other generic upstream `GEN-ERR` replies
+can still hide their cause; account discovery and health diagnostics help narrow it down.
 
 ## Safety knobs
 

@@ -89,7 +89,7 @@ const CANCELLED_BY_OWNER = "cancelled by owner";
 type Outcome = {
   readonly text: string;
   readonly error: string | null;
-  /** Ход погашен снаружи (⏹ или /stop): отправлять нечего и не нужно. */
+  /** Ход погашен снаружи (/stop): отправлять нечего и не нужно. */
   readonly cancelled?: boolean;
 };
 
@@ -115,7 +115,7 @@ function writeQuietly(
 /**
  * Взять чат под ход напоминания — тем же путём, что и канал
  * (agent/lib/telegram-turn-start.ts). Живой чужой ход не трогаем вовсе: напоминание тогда
- * идёт без присмотра, зато ⏹ владельца продолжает бить по его же сессии. Не взяли — false.
+ * идёт без присмотра, зато /stop владельца продолжает бить по его же сессии. Не взяли — false.
  * Запись напоминания — это запись с ЕГО sessionId, другого признака у неё нет: клейм чата
  * под чужим ходом остался бы в run-status неотличим от чужого.
  */
@@ -132,8 +132,6 @@ async function claimChat(
       staleMs: RUN_STALE_MS,
       getStatusImpl: getChatStatus,
       setStatusIfImpl: setChatStatusIf,
-      removeWorkingStatusImpl: (messageId) =>
-        leaveOrphanStatus(row, messageId, deps),
       onWorkingStatusError: (error) =>
         deps.log("remind: run-status claim failed:", error),
     });
@@ -141,22 +139,6 @@ async function claimChat(
     deps.log("remind: run-status claim failed:", error);
     return false;
   }
-}
-
-/**
- * Осиротевший индикатор мёртвого хода: канал сам удаляет такое сообщение, а ребёнку удалять
- * нечем — его Bot API-шов живёт в мосте (scripts/lib/telegram-send.ts только отправляет).
- * Молча бросить его нельзя, поэтому он остаётся видимым в журнале.
- */
-function leaveOrphanStatus(
-  row: Reminder,
-  messageId: number,
-  deps: Wiring,
-): Promise<void> {
-  deps.log(
-    `reminders: ${row.id} working status ${messageId} of a dead turn stays in the chat`,
-  );
-  return Promise.resolve();
 }
 
 /** Пульс живого хода: без него долгий ход выглядит протухшим и стоп его не находит. */
@@ -174,7 +156,7 @@ function releaseChat(chatKey: string, sessionId: string): void {
   setChatStatusIf(
     chatKey,
     { sessionId },
-    { status: "idle", sessionId: null, turnId: null },
+    { status: "idle", sessionId: null, turnId: null, draftId: null },
   );
 }
 
@@ -297,6 +279,13 @@ function replyOf(
   return textOrFallback(turn.message, fallback);
 }
 
+/** Клиент хода строки: Signal называет себя своим видом, остальное — Reminder. */
+const clientFor = (row: Reminder, env: NodeJS.ProcessEnv) =>
+  reminderClientOptions(
+    env,
+    row.id.startsWith("signal-") ? "signal" : "reminder",
+  );
+
 /** Один ход агента по тексту напоминания. Любой его провал отдаётся текстом строки. */
 async function agentOutcome(
   row: Reminder,
@@ -314,9 +303,9 @@ async function agentOutcome(
     tr,
   );
   try {
-    const turn = await deps.runTurn(prompt, reminderClientOptions(deps.env), {
+    const turn = await deps.runTurn(prompt, clientFor(row, deps.env), {
       log: deps.log,
-      // Пока ход идёт, чат и тема строки видят его сессию: по ней ⏹ и /stop гасят её.
+      // Пока ход идёт, чат и тема строки видят его сессию: по ней /stop гасит её.
       watch: chatWatch(row, target, deps),
     });
     return replyOf(turn, row.text, sessionLimitText(row.text, tr));

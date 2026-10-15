@@ -1,0 +1,104 @@
+--------------------------- MODULE HelperOutcome ---------------------------
+EXTENDS Naturals, FiniteSets, TLC
+CONSTANT Mutant
+Helpers == {"a", "b"}
+Keep == 1
+VARIABLES s, readPure
+vars == <<s, readPure>>
+Durable(x) == <<x.status, x.outcome, x.finishes, x.finished, x.deliveredAt, x.retained>>
+\* Session/turn belongs to consumer memory; durable row holds only deliveredAt.
+Ready(h) == s.status[h] = "finished" /\ s.deliveredAt[h] = 0
+InitCore == s = [status |-> [h \in Helpers |-> "pending"],
+  outcome |-> [h \in Helpers |-> FALSE], finishes |-> [h \in Helpers |-> 0],
+  finished |-> [h \in Helpers |-> 0],
+  deliveredAt |-> [h \in Helpers |-> 0], retained |-> Helpers,
+  session |-> 1, reads |-> {}, previousReads |-> {}, readCounts |-> [h \in Helpers |-> 0],
+  replied |-> FALSE, nonempty |-> FALSE, now |-> 0,
+  proof |-> [h \in Helpers |-> TRUE],
+  lostUnread |-> FALSE, sweptEarly |-> FALSE, readAuthorized |-> TRUE,
+  bridge |-> "online", events |-> {}, offlineFinished |-> {}, bridgeReturned |-> FALSE]
+Init == InitCore /\ readPure = TRUE
+Finish(h) ==
+  /\ s.status[h] = "pending" \/ (Mutant = "finish-twice" /\ s.finishes[h] = 1)
+  /\ s' = [s EXCEPT !.status[h] = "finished", !.outcome[h] = TRUE,
+       !.finishes[h] = @ + 1, !.finished[h] = s.now,
+       !.events = IF s.bridge = "online" THEN @ \cup {h} ELSE @,
+       !.offlineFinished = IF s.bridge = "offline" THEN @ \cup {h} ELSE @]
+Read(h,actor) ==
+  /\ actor = "owner" \/ Mutant = "foreign-read"
+  /\ h \in s.retained /\ s.outcome[h] /\ ~s.replied /\ h \notin s.reads
+  /\ s.readCounts[h] < 2
+  /\ Mutant # "hide-unread"
+  /\ s' = [s EXCEPT !.reads = @ \cup {h}, !.previousReads = @ \cup {h},
+       !.readCounts[h] = @ + 1,
+       !.deliveredAt[h] = IF Mutant = "read-write" THEN s.now + 1 ELSE @,
+       !.readAuthorized = @ /\ actor = "owner"]
+BridgeDown == /\ s.bridge = "online" /\ s' = [s EXCEPT !.bridge = "offline"]
+BridgeUp ==
+  /\ s.bridge = "offline"
+  /\ s' = [s EXCEPT !.bridge = IF Mutant = "bridge-stays-down" THEN "offline" ELSE "online",
+       !.events = {}, !.bridgeReturned = TRUE]
+Reply(nonempty) ==
+  /\ ~s.replied
+  /\ s' = [s EXCEPT !.replied = TRUE, !.nonempty = nonempty]
+Mark(h) ==
+  /\ Ready(h)
+  /\ (h \in s.reads) \/ Mutant = "without-read" \/
+       (Mutant = "turn-only" /\ h \in s.previousReads /\ s.session = 2)
+  /\ (s.replied /\ s.nonempty) \/ Mutant = "before-reply" \/
+       (Mutant = "empty-reply" /\ s.replied)
+  /\ s' = [s EXCEPT !.deliveredAt[h] = s.now + 1,
+       !.proof[h] = s.replied /\ s.nonempty /\ h \in s.reads]
+Restart ==
+  /\ s.session = 1
+  /\ s' = [s EXCEPT !.session = 2, !.reads = {}, !.replied = FALSE, !.nonempty = FALSE]
+Close(h) ==
+  /\ h \in s.retained /\ s.status[h] \in {"pending", "finished"}
+  /\ s.deliveredAt[h] = 0
+  /\ s' = [s EXCEPT !.status[h] = "closed", !.outcome[h] = TRUE,
+       !.finished[h] = IF s.outcome[h] THEN @ ELSE s.now]
+Clock == /\ s.now < 2 /\ s' = [s EXCEPT !.now = @ + 1]
+Sweep(h) ==
+  /\ h \in s.retained
+  /\ (s.status[h] = "closed" /\ s.now >= s.finished[h] + Keep)
+      \/ (s.deliveredAt[h] # 0 /\ s.now + 1 >= s.deliveredAt[h] + Keep)
+      \/ (Mutant = "lose-unread" /\ Ready(h))
+      \/ (Mutant = "early-close" /\ s.status[h] = "closed")
+  /\ s' = [s EXCEPT !.retained = @ \ {h},
+       !.lostUnread = @ \/ Ready(h),
+       !.sweptEarly = @ \/ (s.status[h] = "closed" /\ s.now < s.finished[h] + Keep)]
+NextCore == (\E h \in Helpers : Finish(h) \/ (\E actor \in {"owner","unknown","helper"} : Read(h,actor))
+          \/ Mark(h) \/ Close(h) \/ Sweep(h))
+        \/ (\E b \in BOOLEAN : Reply(b)) \/ Restart \/ Clock \/ BridgeDown \/ BridgeUp
+ObserveRead == readPure' = (readPure /\
+  ((\E h \in Helpers, actor \in {"owner","unknown","helper"} : Read(h,actor)) => Durable(s') = Durable(s)))
+Next == NextCore /\ ObserveRead
+Spec == Init /\ [][Next]_vars
+\* A finished offline remains available to Read; only B, finished after recovery, emits an event.
+BridgeRecoveryNext ==
+  \/ (s.status["a"] = "pending" /\ ~s.bridgeReturned /\ BridgeDown)
+  \/ (s.bridge = "offline" /\ s.status["a"] = "pending" /\ Finish("a"))
+  \/ (s.status["a"] = "finished" /\ ~s.bridgeReturned /\ BridgeUp)
+  \/ (s.bridgeReturned /\ s.status["b"] = "pending" /\ Finish("b"))
+BridgeRecoverySpec == Init /\ [][BridgeRecoveryNext /\ ObserveRead]_vars
+BridgeRecovered == s.bridgeReturned => s.bridge = "online"
+RecoveredDelivery == s.status["b"] = "finished" => "b" \in s.events
+OfflineNotReplayed == "a" \in s.offlineFinished => "a" \notin s.events
+NoRecoveryComplete == ~("a" \in s.offlineFinished /\ "b" \in s.events)
+TypeOK == /\ s.session \in {1,2} /\ s.now \in 0..2
+          /\ s.retained \subseteq Helpers /\ s.reads \subseteq Helpers
+          /\ \A h \in Helpers : s.status[h] \in {"pending","finished","closed"}
+OutcomeOnce == \A h \in Helpers : s.finishes[h] <= 1
+DeliveredAfterReply == \A h \in Helpers : s.deliveredAt[h] # 0 => s.proof[h]
+UndeliveredKept == ~s.lostUnread
+Visible == \A h \in Helpers : Ready(h) /\ h \in s.retained /\ ~s.replied /\
+  h \notin s.reads /\ s.readCounts[h] < 2 => ENABLED Read(h,"owner")
+ClosedKept == ~s.sweptEarly
+ReadPure == readPure
+ClosedFinal == \A h \in Helpers : s.status[h] = "closed" => s.outcome[h]
+\* Reachability witnesses: multiple outcomes and repeated reading after restart are accepted.
+NoTwoReads == Cardinality(s.reads) < 2
+NoRepeatedRead == \A h \in Helpers : s.readCounts[h] < 2
+AuthorizedReads == s.readAuthorized
+OfflineEvent == s.offlineFinished \subseteq s.events
+=============================================================================

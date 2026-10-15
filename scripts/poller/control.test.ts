@@ -1,8 +1,6 @@
 /* eslint-disable @typescript-eslint/no-floating-promises, @typescript-eslint/require-await -- Node owns test registration; async doubles preserve the I/O boundary. */
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import {
-  existsSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -12,7 +10,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { requestTelegramCancel } from "#lib/telegram-cancel-client.ts";
+import fc from "fast-check";
+import { TELEGRAM_BUTTON_TAP_FIELD } from "#lib/telegram-parts.ts";
 
 type Event = string | [string, string, number | undefined, string | undefined];
 type CaptureMessage = { message_id?: number };
@@ -57,11 +56,20 @@ type ControlModule = {
       pluginTapImpl?: (tap: {
         digest12: string;
         chatId: number;
-      }) => Promise<void>;
+      }) => Promise<unknown>;
+      scheduleImpl?: (key: string, task: () => Promise<void>) => boolean;
+      deleteImpl?: (chatId: number, messageId: number) => Promise<boolean>;
+      editTapImpl?: (
+        chatId: number,
+        messageId: number,
+        edit: unknown,
+      ) => Promise<boolean>;
     },
   ) => Promise<boolean>;
   OUT_OF_BAND_COMMANDS: string[];
   TELEGRAM_EVE_CALLBACK_PREFIXES: readonly string[];
+  TAP_CONTEXT_LIMIT: number;
+  tapContextText: (message: Record<string, unknown> | undefined) => string;
 };
 type RunStatusModule = {
   setChatStatus: (chatKey: string, patch: Record<string, unknown>) => void;
@@ -117,7 +125,7 @@ writeFileSync(
 );
 process.env.TELEGRAM_BOT_TOKEN = "424242:test-token";
 process.env.TELEGRAM_WEBHOOK_SECRET_TOKEN = "test-secret";
-process.env.TELEGRAM_ALLOWED_USER_IDS = "42";
+process.env.TELEGRAM_ALLOWED_USER_IDS = "42,7";
 process.env.IVA_PORT = "8723";
 delete process.env.ASSISTANT_HOST;
 delete process.env.AGENT_LANGUAGE; // без настроек язык моста — ru
@@ -135,6 +143,8 @@ const {
   handleAwaitNonText,
   handleControl,
   OUT_OF_BAND_COMMANDS,
+  TAP_CONTEXT_LIMIT,
+  tapContextText,
   TELEGRAM_EVE_CALLBACK_PREFIXES,
 } = controlModule as ControlModule;
 const status = runStatusModule as RunStatusModule;
@@ -151,8 +161,13 @@ function runningTurn(overrides: Record<string, unknown> = {}) {
     status: "running",
     sessionId: "session-1",
     turnId: "turn-1",
+    draftId: 41,
     ...overrides,
   });
+}
+
+function nativeStop(): ControlUpdate {
+  return { update_id: 5, stopped_message_generation: { chat, draft_id: 41 } };
 }
 
 function stopButton(): ControlUpdate {
@@ -433,7 +448,7 @@ test("the ⏹ Stop button cancels through the channel route, never through Eve",
   runningTurn();
   const { cancels, acks, replies, deps } = recordingDeps();
 
-  const consumed = await handleControl(stopButton(), deps);
+  const consumed = await handleControl(nativeStop(), deps);
 
   assert.equal(consumed, true); // тап съеден мостом и в eve не уходит
   assert.deepEqual(cancels, [
@@ -444,8 +459,26 @@ test("the ⏹ Stop button cancels through the channel route, never through Eve",
       turnId: "turn-1",
     },
   ]);
-  assert.deepEqual(acks, [["cq-5", "Останавливаю…"]]);
+  assert.deepEqual(acks, []);
   assert.deepEqual(replies, []);
+});
+
+test("the legacy iva_cancel button stays out of the inbox and cancels the recorded pair", async () => {
+  runningTurn();
+  writeFileSync(
+    join(
+      dataDir,
+      "run-status.d",
+      `${Buffer.from("7:").toString("base64url")}.json`,
+    ),
+    JSON.stringify({ ...status.getChatStatus("7:"), statusMessageId: 4 }),
+  );
+  const { cancels, acks, deps } = recordingDeps();
+  assert.equal(await handleControl(stopButton(), deps), true);
+  assert.equal(cancels.length, 1);
+  assert.equal(cancels[0].sessionId, "session-1");
+  assert.equal(cancels[0].turnId, "turn-1");
+  assert.deepEqual(acks, [["cq-5", undefined]]);
 });
 
 test("/stop takes the same door and stays silent while the status message speaks", async () => {
@@ -475,11 +508,11 @@ test("Stop on an idle chat explains itself and never calls cancel", async () => 
   });
   const { cancels, acks, replies, deps } = recordingDeps();
 
-  assert.equal(await handleControl(stopButton(), deps), true);
+  assert.equal(await handleControl(nativeStop(), deps), true);
   assert.equal(await handleControl(stopCommand(), deps), true);
 
   assert.deepEqual(cancels, []);
-  assert.deepEqual(acks, [["cq-5", "Сейчас ничего не выполняется."]]);
+  assert.deepEqual(acks, []);
   assert.deepEqual(replies, [[7, "Сейчас ничего не выполняется."]]);
 });
 
@@ -492,25 +525,25 @@ test("an early running status without a session is not cancellable", async () =>
   });
   const { cancels, acks, deps } = recordingDeps();
 
-  assert.equal(await handleControl(stopButton(), deps), true);
+  assert.equal(await handleControl(nativeStop(), deps), true);
 
   assert.deepEqual(cancels, []);
-  assert.deepEqual(acks, [["cq-5", "Сейчас ничего не выполняется."]]);
+  assert.deepEqual(acks, []);
 });
 
 test("an untrusted tap on someone else's Stop button is swallowed", async () => {
   runningTurn();
   const { cancels, acks, deps } = recordingDeps();
-  const update = stopButton();
-  (update.callback_query as Record<string, unknown>).from = {
+  const update = nativeStop();
+  (update.stopped_message_generation as Record<string, unknown>).chat = {
     id: 999,
-    is_bot: false,
+    type: "private",
   };
 
   assert.equal(await handleControl(update, deps), true);
   assert.deepEqual(cancels, []);
   // Спиннер кнопки гасим, но ход чужого пользователя не трогаем и ничего не объясняем.
-  assert.deepEqual(acks, [["cq-5", undefined]]);
+  assert.deepEqual(acks, []);
 });
 
 // Терминальное событие отмены глазами моста: такую запись оставляет turn.cancelled.
@@ -548,7 +581,7 @@ test("a stale run record still reaches the cancel route while it remembers the s
   backdateRunStatus("session-1", 31 * 60_000);
   const cancels: CancelCall[] = [];
   const acks: Array<[string, string | undefined]> = [];
-  const consumed = await handleControl(stopButton(), {
+  const consumed = await handleControl(nativeStop(), {
     cancelImpl: async (input: CancelCall) => {
       cancels.push(input);
       stopTurn("7:");
@@ -569,7 +602,7 @@ test("a stale run record still reaches the cancel route while it remembers the s
       turnId: "turn-1",
     },
   ]);
-  assert.deepEqual(acks, [["cq-5", "Останавливаю…"]]);
+  assert.deepEqual(acks, []);
 });
 
 test("a stale run record whose turn is already gone ends as idle", async () => {
@@ -577,7 +610,7 @@ test("a stale run record whose turn is already gone ends as idle", async () => {
   backdateRunStatus("session-1", 31 * 60_000);
   const cancels: CancelCall[] = [];
   const acks: Array<[string, string | undefined]> = [];
-  const consumed = await handleControl(stopButton(), {
+  const consumed = await handleControl(nativeStop(), {
     cancelImpl: async (input: CancelCall) => {
       cancels.push(input);
       return { ok: true, status: "no_active_turn" };
@@ -590,730 +623,7 @@ test("a stale run record whose turn is already gone ends as idle", async () => {
 
   assert.equal(consumed, true);
   assert.equal(cancels.length, 1);
-  assert.deepEqual(acks, [["cq-5", "Сейчас ничего не выполняется."]]);
-});
-
-// ── Фон «Стопа» ──
-//
-// Цикл моста отдаёт работу планировщику и уходит за следующим апдейтом: ожидание
-// подтверждения живёт там, в фоне. Двойник планировщика показывает тесту и то, что ушло в
-// фон, и когда задача выполнится. Настоящий фон между тестами жить не должен.
-function recordingScheduler() {
-  const pending = new Map<string, () => Promise<void>>();
-  return {
-    keys: () => [...pending.keys()],
-    scheduleImpl: (key: string, task: () => Promise<void>) => {
-      if (pending.has(key)) return false;
-      pending.set(key, task);
-      return true;
-    },
-    // Задача снимается со слота сразу: второй такой же ключ — это уже другой заход.
-    run: async (key: string) => {
-      const task = pending.get(key);
-      if (task === undefined) throw new Error(`nothing scheduled for ${key}`);
-      pending.delete(key);
-      await task();
-    },
-  };
-}
-
-function inlineKeyboard(
-  call: BotCall | undefined,
-): Array<Array<Record<string, unknown>>> | null {
-  const markup = call?.body.reply_markup as
-    { inline_keyboard?: unknown } | undefined;
-  return Array.isArray(markup?.inline_keyboard)
-    ? (markup.inline_keyboard as Array<Array<Record<string, unknown>>>)
-    : null;
-}
-
-// Сообщение с кнопкой рестарта — единственный sendMessage с inline-клавиатурой.
-const restartButtonMessage = (calls: BotCall[]) =>
-  calls.find(
-    (call) => call.method === "sendMessage" && inlineKeyboard(call) !== null,
-  );
-
-const restartButtonData = (calls: BotCall[]) => {
-  const button = inlineKeyboard(restartButtonMessage(calls))?.[0]?.[0];
-  assert.ok(button, "в сообщении нет кнопки рестарта");
-  return String(button.callback_data);
-};
-
-// Ждём наблюдаемый эффект фона: он идёт параллельно тесту, а не по нашей команде.
-async function waitForBotCall(
-  calls: BotCall[],
-  match: (call: BotCall) => boolean,
-): Promise<BotCall> {
-  for (let attempt = 0; attempt < 300; attempt++) {
-    const found = calls.find(match);
-    if (found !== undefined) return found;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error("Bot API call did not happen");
-}
-
-function restartTap(
-  updateId: number,
-  data: string,
-  {
-    from = trustedFrom,
-    chat: targetChat = chat,
-  }: {
-    from?: typeof trustedFrom;
-    chat?: { id: number; type: string };
-  } = {},
-): ControlUpdate {
-  return {
-    update_id: updateId,
-    callback_query: {
-      id: `cq-${updateId}`,
-      from,
-      message: { message_id: 500, date: 1, chat: targetChat },
-      data,
-    },
-  };
-}
-
-// Принятая отмена без подтверждения: роут отвечает, ход не заканчивается.
-const acceptedCancel = async () => ({ ok: true, status: "accepted" }) as const;
-
-// Двойник молчащего cancel-роута: запрос уходит, ответа нет — так выглядит зависший агент.
-// Таймаут клиента уважаем (сигнал обрывает ожидание), иначе тест повис бы навсегда.
-function silentRouteCancel(
-  timeoutMs: number,
-): (input: CancelCall) => Promise<unknown> {
-  return (input) =>
-    requestTelegramCancel({
-      ...input,
-      timeoutMs,
-      fetchImpl: (_url, init) =>
-        new Promise<Response>((_resolve, reject) => {
-          const abort = () =>
-            reject(
-              init.signal?.reason instanceof Error
-                ? init.signal.reason
-                : new Error("cancel route timed out"),
-            );
-          if (init.signal?.aborted === true) abort();
-          else init.signal?.addEventListener("abort", abort);
-        }),
-    });
-}
-
-// Отпечаток тот же, что мост кладёт в data кнопки: так выглядит нажатие, пришедшее из
-// прошлой жизни моста — от кнопки остались только её байты да запись хода на диске.
-function previousLifeRestartData(sessionId: string): string {
-  return `iva_stoprestart:${createHash("sha256")
-    .update(sessionId)
-    .digest("hex")
-    .slice(0, 12)}`;
-}
-
-// Нажатие кнопки рестарта и общая обвязка её обработки: акки, сбросы и ответы в чат.
-function restartDeps(scheduler: ReturnType<typeof recordingScheduler>) {
-  const acks: Array<[string, string | undefined]> = [];
-  const resets: ResetCall[] = [];
-  const replies: string[] = [];
-  return {
-    acks,
-    resets,
-    replies,
-    deps: {
-      cancelImpl: acceptedCancel,
-      confirmTimeoutMs: 20,
-      watchTimeoutMs: 20,
-      scheduleImpl: scheduler.scheduleImpl,
-      performResetImpl: async (
-        key: string,
-        target: Record<string, unknown>,
-        options: Record<string, unknown>,
-      ) => {
-        resets.push([key, target, options]);
-      },
-      replyImpl: async (_chatId: number | undefined, text: string) => {
-        replies.push(text);
-        return { message_id: 1 };
-      },
-      ackImpl: async (id: string, text?: string) => {
-        acks.push([id, text]);
-        return { ok: true, result: true };
-      },
-    },
-  };
-}
-
-// Кнопка из сообщения, которое мост отправил на прошлой серии нажатий ⏹.
-async function restartButtonOf(
-  scheduler: ReturnType<typeof recordingScheduler>,
-  calls: BotCall[],
-  deps: Record<string, unknown>,
-): Promise<string> {
-  assert.equal(await handleControl(stopButton(), deps), true);
-  await scheduler.run(scheduler.keys()[0]);
-  return restartButtonData(calls);
-}
-
-test("the Stop handler hands the wait to the background and never blocks the bridge", async () => {
-  runningTurn({ sessionId: "session-slow" });
-  const scheduler = recordingScheduler();
-  const acks: Array<[string, string | undefined]> = [];
-  const deps = {
-    cancelImpl: acceptedCancel,
-    scheduleImpl: scheduler.scheduleImpl,
-    ackImpl: async (id: string, text?: string) => {
-      acks.push([id, text]);
-      return { ok: true, result: true };
-    },
-  };
-
-  const started = Date.now();
-  assert.equal(await handleControl(stopButton(), deps), true);
-  const waitingMs = Date.now() - started;
-
-  // Окно ожидания по умолчанию — 60 с: тест идёт мгновенно только потому, что цикл его не ждёт.
-  assert.ok(waitingMs < 1000, `мост держал цикл ${waitingMs} мс`);
-  assert.deepEqual(acks, [["cq-5", "Останавливаю…"]]);
-  assert.equal(scheduler.keys().length, 1, "ожидание не ушло в фон");
-  // Оно и правда висит: подтверждения не было, ход всё ещё «идёт».
-  assert.equal(status.getChatStatus("7:")?.status, "running");
-
-  // И пока оно висит, цикл обслуживает следующий апдейт.
-  const { replies, deps: otherDeps } = recordingDeps();
-  const otherStarted = Date.now();
-  assert.equal(await handleControl(textUpdate(8, "/help"), otherDeps), true);
-  assert.ok(Date.now() - otherStarted < 1000);
-  assert.equal(replies.length, 1);
-});
-
-test("an unstopped turn offers the owner a restart button, and only the button restarts", async () => {
-  runningTurn({ sessionId: "session-button" });
-  const scheduler = recordingScheduler();
-  await withFakeSystemctl(0, async (argsLog) => {
-    await withBotApi(botOk, async (calls) => {
-      const resets: ResetCall[] = [];
-      const replies: Array<[number | undefined, string]> = [];
-      const deps = {
-        cancelImpl: acceptedCancel,
-        confirmTimeoutMs: 20,
-        watchTimeoutMs: 20,
-        scheduleImpl: scheduler.scheduleImpl,
-        performResetImpl: async (
-          key: string,
-          target: Record<string, unknown>,
-          options: Record<string, unknown>,
-        ) => {
-          resets.push([key, target, options]);
-        },
-        replyImpl: async (chatId: number | undefined, text: string) => {
-          replies.push([chatId, text]);
-          return { message_id: 1 };
-        },
-        ackImpl: async () => ({ ok: true, result: true }),
-      };
-
-      // Серия нажатий ⏹ — одна фоновая задача, значит одно сообщение.
-      for (let tap = 0; tap < 3; tap++)
-        assert.equal(await handleControl(stopButton(), deps), true);
-      assert.equal(scheduler.keys().length, 1);
-      await scheduler.run(scheduler.keys()[0]);
-
-      const notice = await waitForBotCall(
-        calls,
-        (call) =>
-          call.method === "sendMessage" && inlineKeyboard(call) !== null,
-      );
-      // Окно теста — 20 мс, в тексте — округлённое окно (меньше секунды не называем).
-      assert.match(String(notice.body.text), /Ход не остановился за 1 с\./u);
-      assert.match(String(notice.body.text), /оборвёт работу во всех чатах/u);
-      assert.equal(
-        inlineKeyboard(notice)?.[0]?.[0]?.text,
-        "🔁 Перезапустить Iva",
-      );
-      // Авторестарта нет: пока кнопку не нажали, сервис не трогаем.
-      assert.equal(systemctlCalls(argsLog), "");
-      assert.deepEqual(resets, []);
-
-      const data = restartButtonData(calls);
-      assert.equal(await handleControl(restartTap(30, data), deps), true);
-      // Второе нажатие — та же серия: второй задачи и второго рестарта не будет.
-      assert.equal(await handleControl(restartTap(31, data), deps), true);
-      assert.equal(scheduler.keys().length, 1);
-      await scheduler.run(scheduler.keys()[0]);
-
-      assert.equal(systemctlCalls(argsLog), "--user restart iva.service\n");
-      assert.deepEqual(resets, [
-        [
-          "7:",
-          { sessionId: "session-button" },
-          { clearQueue: true, discardThroughUpdateId: 30 },
-        ],
-      ]);
-      assert.deepEqual(replies, [[7, "♻️ Iva перезапущена"]]);
-      // Сообщение с кнопкой убрано: рестарт говорит о себе сам.
-      assert.deepEqual(
-        calls
-          .filter((call) => call.method === "deleteMessage")
-          .map((call) => call.body.message_id),
-        [500],
-      );
-    });
-  });
-});
-
-test("a confirmation after the message rewrites it and takes the button away", async () => {
-  runningTurn({ sessionId: "session-late" });
-  const scheduler = recordingScheduler();
-  await withBotApi(botOk, async (calls) => {
-    const replies: string[] = [];
-    const deps = {
-      cancelImpl: acceptedCancel,
-      confirmTimeoutMs: 20,
-      scheduleImpl: scheduler.scheduleImpl,
-      replyImpl: async (_chatId: number | undefined, text: string) => {
-        replies.push(text);
-        return { message_id: 1 };
-      },
-      ackImpl: async () => ({ ok: true, result: true }),
-    };
-
-    assert.equal(await handleControl(stopButton(), deps), true);
-    // Задачу не ждём: она висит на подтверждении — ровно то, что проверяется.
-    const waiting = scheduler.run(scheduler.keys()[0]);
-    await waitForBotCall(
-      calls,
-      (call) => call.method === "sendMessage" && inlineKeyboard(call) !== null,
-    );
-
-    // Ход всё-таки остановился: сообщение обязано сказать это, а кнопка — исчезнуть.
-    stopTurn("7:");
-    const edited = await waitForBotCall(
-      calls,
-      (call) =>
-        call.method === "editMessageText" &&
-        String(call.body.text).includes("Остановлено"),
-    );
-    await waiting;
-
-    assert.equal(edited.body.message_id, 500);
-    assert.deepEqual(inlineKeyboard(edited), []);
-    assert.deepEqual(replies, []);
-  });
-});
-
-test("a group gets the honest text about the unstopped turn and no restart button", async () => {
-  const groupId = -100500;
-  status.setChatStatus(`${groupId}:`, {
-    status: "running",
-    sessionId: "group-session",
-    turnId: "turn-group",
-  });
-  const scheduler = recordingScheduler();
-  await withFakeSystemctl(0, async (argsLog) => {
-    await withBotApi(botOk, async (calls) => {
-      const resets: ResetCall[] = [];
-      const replies: Array<[number | undefined, string]> = [];
-      const deps = {
-        cancelImpl: acceptedCancel,
-        confirmTimeoutMs: 20,
-        watchTimeoutMs: 20,
-        scheduleImpl: scheduler.scheduleImpl,
-        performResetImpl: async (
-          key: string,
-          target: Record<string, unknown>,
-          options: Record<string, unknown>,
-        ) => {
-          resets.push([key, target, options]);
-        },
-        replyImpl: async (chatId: number | undefined, text: string) => {
-          replies.push([chatId, text]);
-          return { message_id: 1 };
-        },
-        ackImpl: async () => ({ ok: true, result: true }),
-      };
-
-      assert.equal(
-        await handleControl(
-          {
-            update_id: 7,
-            message: {
-              message_id: 7,
-              date: 1,
-              chat: { id: groupId, type: "supergroup" },
-              from: trustedFrom,
-              text: "/stop",
-            },
-          },
-          deps,
-        ),
-        true,
-      );
-      await scheduler.run(scheduler.keys()[0]);
-
-      // Текст честный, кнопки нет: рестарт из группы не предлагается.
-      assert.deepEqual(replies, [[groupId, "Ход не остановился за 1 с."]]);
-      assert.equal(restartButtonMessage(calls), undefined);
-      assert.equal(systemctlCalls(argsLog), "");
-      assert.deepEqual(resets, []);
-    });
-  });
-  stopTurn(`${groupId}:`);
-});
-
-test("a restart button tap from a group or a stranger never restarts", async () => {
-  runningTurn({ sessionId: "session-guard" });
-  const scheduler = recordingScheduler();
-  await withFakeSystemctl(0, async (argsLog) => {
-    await withBotApi(botOk, async (calls) => {
-      const acks: Array<[string, string | undefined]> = [];
-      const resets: ResetCall[] = [];
-      const deps = {
-        cancelImpl: acceptedCancel,
-        confirmTimeoutMs: 20,
-        watchTimeoutMs: 20,
-        scheduleImpl: scheduler.scheduleImpl,
-        performResetImpl: async (
-          key: string,
-          target: Record<string, unknown>,
-          options: Record<string, unknown>,
-        ) => {
-          resets.push([key, target, options]);
-        },
-        replyImpl: async () => ({ message_id: 1 }),
-        ackImpl: async (id: string, text?: string) => {
-          acks.push([id, text]);
-          return { ok: true, result: true };
-        },
-      };
-
-      assert.equal(await handleControl(stopButton(), deps), true);
-      await scheduler.run(scheduler.keys()[0]);
-      const data = restartButtonData(calls);
-      acks.length = 0;
-
-      // Чужой в личке и владелец в группе: спиннер гасим, рестарта нет.
-      assert.equal(
-        await handleControl(
-          restartTap(40, data, { from: { id: 999, is_bot: false } }),
-          deps,
-        ),
-        true,
-      );
-      assert.equal(
-        await handleControl(
-          restartTap(41, data, { chat: { id: -100500, type: "supergroup" } }),
-          deps,
-        ),
-        true,
-      );
-
-      assert.deepEqual(acks, [
-        ["cq-40", undefined],
-        [
-          "cq-41",
-          "Открой личный чат со мной, чтобы использовать это управление.",
-        ],
-      ]);
-      assert.equal(scheduler.keys().length, 0);
-      assert.equal(systemctlCalls(argsLog), "");
-      assert.deepEqual(resets, []);
-    });
-  });
-  stopTurn("7:");
-});
-
-test("a restart button tap after the turn is over never restarts", async () => {
-  runningTurn({ sessionId: "session-stale" });
-  const scheduler = recordingScheduler();
-  await withFakeSystemctl(0, async (argsLog) => {
-    await withBotApi(botOk, async (calls) => {
-      const acks: Array<[string, string | undefined]> = [];
-      const resets: ResetCall[] = [];
-      const deps = {
-        cancelImpl: acceptedCancel,
-        confirmTimeoutMs: 20,
-        watchTimeoutMs: 20,
-        scheduleImpl: scheduler.scheduleImpl,
-        performResetImpl: async (
-          key: string,
-          target: Record<string, unknown>,
-          options: Record<string, unknown>,
-        ) => {
-          resets.push([key, target, options]);
-        },
-        replyImpl: async () => ({ message_id: 1 }),
-        ackImpl: async (id: string, text?: string) => {
-          acks.push([id, text]);
-          return { ok: true, result: true };
-        },
-      };
-
-      assert.equal(await handleControl(stopButton(), deps), true);
-      await scheduler.run(scheduler.keys()[0]);
-      const data = restartButtonData(calls);
-      acks.length = 0;
-
-      // Ход закончился сам: кнопка по нему уже ничего не решает.
-      stopTurn("7:");
-      assert.equal(await handleControl(restartTap(42, data), deps), true);
-
-      assert.deepEqual(acks, [["cq-42", "Этот ход уже завершился."]]);
-      assert.equal(scheduler.keys().length, 0);
-      assert.equal(systemctlCalls(argsLog), "");
-      assert.deepEqual(resets, []);
-    });
-  });
-});
-
-test("the restart button's reset removes the working status message", async () => {
-  runningTurn({ sessionId: "session-working" });
-  // «Работаю… ⏹» этого хода: после рестарта сообщение обязано исчезнуть — иначе в чате
-  // останется кнопка по ходу, которого больше нет.
-  status.setChatStatus("7:", { statusMessageId: 501 });
-  const scheduler = recordingScheduler();
-  await withFakeSystemctl(0, async (argsLog) => {
-    // Роут сброса — не Bot API: у него свой ответ, иначе настоящий сброс не пройдёт.
-    const respond = (method: string) =>
-      method === "reset"
-        ? { ok: true, status: "reset" }
-        : { ok: true, result: { message_id: 500 } };
-    await withBotApi(respond, async (calls) => {
-      const deps = {
-        cancelImpl: acceptedCancel,
-        confirmTimeoutMs: 20,
-        watchTimeoutMs: 20,
-        scheduleImpl: scheduler.scheduleImpl,
-        // Настоящий сброс: то же, что делают /new и /restart.
-        performResetImpl: queue.performScopedReset,
-        replyImpl: async () => ({ message_id: 1 }),
-        ackImpl: async () => ({ ok: true, result: true }),
-      };
-
-      assert.equal(await handleControl(stopButton(), deps), true);
-      await scheduler.run(scheduler.keys()[0]);
-      const data = restartButtonData(calls);
-      assert.equal(await handleControl(restartTap(50, data), deps), true);
-      await scheduler.run(scheduler.keys()[0]);
-
-      assert.equal(systemctlCalls(argsLog), "--user restart iva.service\n");
-      assert.deepEqual(
-        calls
-          .filter((call) => call.method === "deleteMessage")
-          .map((call) => call.body.message_id),
-        [500, 501],
-      );
-      // Сброс закрыл ход: чат снова свободен.
-      assert.equal(status.getChatStatus("7:")?.status, "idle");
-    });
-  });
-});
-
-test("a restart that systemd refuses is reported and the reset still happens", async () => {
-  runningTurn({ sessionId: "session-refused" });
-  const scheduler = recordingScheduler();
-  // systemctl отказывает: честный текст обязан сказать об этом, а не про перезапуск.
-  await withFakeSystemctl(1, async (argsLog) => {
-    await withBotApi(botOk, async (calls) => {
-      const resets: ResetCall[] = [];
-      const replies: string[] = [];
-      const deps = {
-        cancelImpl: acceptedCancel,
-        confirmTimeoutMs: 20,
-        watchTimeoutMs: 20,
-        scheduleImpl: scheduler.scheduleImpl,
-        performResetImpl: async (
-          key: string,
-          target: Record<string, unknown>,
-          options: Record<string, unknown>,
-        ) => {
-          resets.push([key, target, options]);
-        },
-        replyImpl: async (_chatId: number | undefined, text: string) => {
-          replies.push(text);
-          return { message_id: 1 };
-        },
-        ackImpl: async () => ({ ok: true, result: true }),
-      };
-
-      assert.equal(await handleControl(stopButton(), deps), true);
-      await scheduler.run(scheduler.keys()[0]);
-      assert.equal(
-        await handleControl(restartTap(60, restartButtonData(calls)), deps),
-        true,
-      );
-      await scheduler.run(scheduler.keys()[0]);
-
-      assert.equal(systemctlCalls(argsLog), "--user restart iva.service\n");
-      // Сброс сделан независимо от исхода рестарта: он лечит зависший ход сам.
-      assert.equal(resets.length, 1);
-      assert.deepEqual(replies, ["⚠️ Не удалось перезапустить Iva"]);
-    });
-  });
-});
-
-test("the honest text names the window it actually waited", async () => {
-  runningTurn({ sessionId: "session-window" });
-  const scheduler = recordingScheduler();
-  await withBotApi(botOk, async (calls) => {
-    const { deps } = restartDeps(scheduler);
-    // Ждём две секунды, а не дефолтные шестьдесят: число в тексте — то же окно, что отработало.
-    const waiting = { ...deps, confirmTimeoutMs: 2000 };
-
-    assert.equal(await handleControl(stopButton(), waiting), true);
-    await scheduler.run(scheduler.keys()[0]);
-
-    const notice = await waitForBotCall(
-      calls,
-      (call) => call.method === "sendMessage" && inlineKeyboard(call) !== null,
-    );
-    assert.match(String(notice.body.text), /Ход не остановился за 2 с\./u);
-    assert.doesNotMatch(String(notice.body.text), /60/u);
-  });
-  stopTurn("7:");
-});
-
-test("the first restart press says the restart has started, the second says it is running", async () => {
-  runningTurn({ sessionId: "session-ack" });
-  const scheduler = recordingScheduler();
-  await withBotApi(botOk, async (calls) => {
-    const { acks, deps } = restartDeps(scheduler);
-    const data = await restartButtonOf(scheduler, calls, deps);
-    acks.length = 0;
-
-    assert.equal(await handleControl(restartTap(80, data), deps), true);
-    assert.equal(await handleControl(restartTap(81, data), deps), true);
-
-    // Молчаливого ответа нет: первое нажатие слышит «начал», повтор — «уже идёт».
-    assert.deepEqual(acks, [
-      ["cq-80", "♻️ Перезапускаю Iva"],
-      ["cq-81", "♻️ Перезапуск Iva уже идёт"],
-    ]);
-    // Рестарт ровно один: второй тап остался той же задачей.
-    assert.equal(scheduler.keys().length, 1);
-  });
-  stopTurn("7:");
-});
-
-test("a restart tap that lands after the turn stopped never restarts", async () => {
-  runningTurn({ sessionId: "session-race" });
-  const scheduler = recordingScheduler();
-  await withFakeSystemctl(0, async (argsLog) => {
-    await withBotApi(botOk, async (calls) => {
-      const { resets, replies, deps } = restartDeps(scheduler);
-      const data = await restartButtonOf(scheduler, calls, deps);
-
-      // Тап ушёл в фон, а ход успел подтвердить остановку до старта задачи.
-      assert.equal(await handleControl(restartTap(70, data), deps), true);
-      stopTurn("7:");
-      await scheduler.run(scheduler.keys()[0]);
-
-      assert.deepEqual(replies, ["Этот ход уже завершился."]);
-      assert.equal(systemctlCalls(argsLog), "");
-      assert.deepEqual(resets, []);
-    });
-  });
-});
-
-test("a silent cancel route ends with one honest message and no restart", async () => {
-  runningTurn({ sessionId: "session-silent" });
-  const scheduler = recordingScheduler();
-  await withFakeSystemctl(0, async (argsLog) => {
-    await withBotApi(botOk, async (calls) => {
-      const { resets, deps } = restartDeps(scheduler);
-      const deps2 = { ...deps, cancelImpl: silentRouteCancel(20) };
-
-      // Роут молчит дольше таймаута: серия нажатий — одна задача, одно сообщение.
-      for (let tap = 0; tap < 3; tap++)
-        assert.equal(await handleControl(stopButton(), deps2), true);
-      assert.equal(scheduler.keys().length, 1);
-      await scheduler.run(scheduler.keys()[0]);
-
-      assert.equal(
-        calls.filter(
-          (call) =>
-            call.method === "sendMessage" && inlineKeyboard(call) !== null,
-        ).length,
-        1,
-      );
-      assert.equal(systemctlCalls(argsLog), "");
-      assert.deepEqual(resets, []);
-    });
-  });
-  stopTurn("7:");
-});
-
-test("a restart button from a previous bridge life still restarts a live turn", async () => {
-  // Кнопку сняли до перезапуска моста: в памяти процесса о ней ничего нет — решение
-  // принимают отпечаток sessionId в callback_data и запись хода на диске.
-  runningTurn({ sessionId: "session-old-bridge" });
-  const scheduler = recordingScheduler();
-  await withFakeSystemctl(0, async (argsLog) => {
-    await withBotApi(botOk, async () => {
-      const { resets, replies, acks, deps } = restartDeps(scheduler);
-
-      assert.equal(
-        await handleControl(
-          restartTap(90, previousLifeRestartData("session-old-bridge")),
-          deps,
-        ),
-        true,
-      );
-      await scheduler.run(scheduler.keys()[0]);
-
-      assert.deepEqual(acks, [["cq-90", "♻️ Перезапускаю Iva"]]);
-      assert.equal(systemctlCalls(argsLog), "--user restart iva.service\n");
-      assert.deepEqual(resets, [
-        [
-          "7:",
-          { sessionId: "session-old-bridge" },
-          { clearQueue: true, discardThroughUpdateId: 90 },
-        ],
-      ]);
-      assert.deepEqual(replies, ["♻️ Iva перезапущена"]);
-    });
-  });
-});
-
-test("a restart button on a record the reaper cleared never restarts", async () => {
-  runningTurn({ sessionId: "session-reaped" });
-  backdateRunStatus("session-reaped", 31 * 60_000);
-  const scheduler = recordingScheduler();
-  await withFakeSystemctl(0, async (argsLog) => {
-    await withBotApi(botOk, async () => {
-      // Жнец гоняется каждой итерацией цикла моста: он и снимает зависшую запись.
-      assert.ok((await queue.reapStaleRuns()) >= 1);
-      assert.equal(status.getChatStatus("7:")?.status, "idle");
-
-      const { resets, acks, deps } = restartDeps(scheduler);
-      assert.equal(
-        await handleControl(
-          restartTap(91, previousLifeRestartData("session-reaped")),
-          deps,
-        ),
-        true,
-      );
-
-      assert.deepEqual(acks, [["cq-91", "Этот ход уже завершился."]]);
-      assert.equal(scheduler.keys().length, 0);
-      assert.equal(systemctlCalls(argsLog), "");
-      assert.deepEqual(resets, []);
-    });
-  });
-});
-
-test("repeated taps after the turn is gone stay harmless", async () => {
-  runningTurn();
-  const { cancels, acks, deps } = recordingDeps();
-
-  await handleControl(stopButton(), deps);
-  status.setChatStatus("7:", { status: "idle", sessionId: null, turnId: null });
-  await handleControl(stopButton(), deps);
-  await handleControl(stopButton(), deps);
-
-  assert.equal(cancels.length, 1);
-  assert.deepEqual(acks.slice(1), [
-    ["cq-5", "Сейчас ничего не выполняется."],
-    ["cq-5", "Сейчас ничего не выполняется."],
-  ]);
+  assert.deepEqual(acks, []);
 });
 
 test("/start is answered by the bridge and never becomes a model turn", async () => {
@@ -1468,7 +778,6 @@ test("settings commands reject every non-private chat before state or Bot API ef
 
 test("local callbacks reject non-private chats before cancellation or dispatch", async () => {
   for (const data of [
-    "iva_cancel",
     "iva_update:do",
     "iva_model:keep",
     "iva_think:keep",
@@ -1500,6 +809,7 @@ test("a non-private rejection does not reveal controls to an untrusted user", as
   const { cancels, acks, deps } = recordingDeps();
   const update = stopButton();
   const callback = update.callback_query as Record<string, unknown>;
+  callback.data = "iva_menu:r:o";
   callback.from = { id: 999, is_bot: false };
   callback.message = {
     message_id: 4,
@@ -1509,7 +819,7 @@ test("a non-private rejection does not reveal controls to an untrusted user", as
 
   assert.equal(await handleControl(update, deps), true);
   assert.deepEqual(cancels, []);
-  assert.deepEqual(acks, [["cq-5", undefined]]);
+  assert.deepEqual(acks, []);
 });
 
 // Кнопка, написанная моделью: её data — реплика пользователя, поэтому тап уходит
@@ -1539,7 +849,8 @@ test("тап по кнопке модели уходит дальше обычн
     false,
     "тап идёт в admission",
   );
-  assert.deepEqual(acks, [["cq-tap", undefined]]);
+  // Сообщение без кнопок в ответе Telegram: подсказка называет data, правки нет.
+  assert.deepEqual(acks, [["cq-tap", "✅ Отложи на час"]]);
   assert.equal(update.callback_query, undefined, "колбэк больше не колбэк");
   assert.deepEqual(update.message, {
     message_id: 77,
@@ -1547,7 +858,9 @@ test("тап по кнопке модели уходит дальше обычн
     message_thread_id: 5,
     chat,
     from: { id: 42, is_bot: false },
-    text: "Отложи на час",
+    text: "Отложи на час\n\n(кнопка под сообщением Ивы: «Напомнить?»)",
+    // Пометка тапа: слив очереди отдаёт его отдельным ходом, не склеивая с соседями.
+    [TELEGRAM_BUTTON_TAP_FIELD]: true,
   });
 });
 
@@ -1771,9 +1084,18 @@ test("a falsey callback ack does not claim a local control", async () => {
     turnId: null,
   });
 
-  const consumed = await handleControl(stopButton(), {
-    ackImpl: async () => null,
-  });
+  const consumed = await handleControl(
+    {
+      ...stopButton(),
+      callback_query: {
+        ...(stopButton().callback_query as Record<string, unknown>),
+        data: "iva_model:keep",
+      },
+    },
+    {
+      ackImpl: async () => null,
+    },
+  );
 
   assert.equal(consumed, false);
 });
@@ -1785,9 +1107,18 @@ test("a false callback ack result does not claim a local control", async () => {
     turnId: null,
   });
 
-  const consumed = await handleControl(stopButton(), {
-    ackImpl: async () => ({ ok: true, result: false }),
-  });
+  const consumed = await handleControl(
+    {
+      ...stopButton(),
+      callback_query: {
+        ...(stopButton().callback_query as Record<string, unknown>),
+        data: "iva_model:keep",
+      },
+    },
+    {
+      ackImpl: async () => ({ ok: true, result: false }),
+    },
+  );
 
   assert.equal(consumed, false);
 });
@@ -2516,10 +1847,6 @@ const edits = (calls: BotCall[]) =>
     .filter((call) => call.method === "editMessageText")
     .map((call) => JSON.stringify(call.body));
 
-// Журнал двойника systemctl: пусто — рестарта не было (файла ещё нет).
-const systemctlCalls = (argsLog: string) =>
-  existsSync(argsLog) ? readFileSync(argsLog, "utf8") : "";
-
 // systemctl подменяется скриптом на PATH: тест никогда не трогает настоящий сервис.
 async function withFakeSystemctl<T>(
   exitCode: number,
@@ -2877,6 +2204,7 @@ function pluginDeps() {
       ...recorded.deps,
       pluginTapImpl: async (tap: { digest12: string; chatId: number }) => {
         taps.push(tap);
+        return "stale";
       },
     },
   };
@@ -2940,4 +2268,1034 @@ test("a failing installer does not crash the bridge and the tap stays consumed",
     }),
     true,
   );
+});
+
+// ── Отклик кнопки модели: подсказка «✅», правка сообщения, память «уже нажато» ──
+// (spec-w2 §2.1 п. 4–5, модель specs/ButtonTap.tla). Память живёт в модуле моста, поэтому
+// у каждого теста свои номера сообщений.
+
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+function modelTap(
+  updateId: number,
+  messageId: number,
+  data: string,
+  message: Record<string, unknown> = {},
+): ControlUpdate {
+  return {
+    update_id: updateId,
+    callback_query: {
+      id: `cq-${updateId}`,
+      from: trustedFrom,
+      data,
+      message: { message_id: messageId, date: 1, chat, ...message },
+    },
+  };
+}
+
+const choiceBlocks = [
+  { type: "paragraph", text: "Поставить плагин?" },
+  {
+    type: "buttons",
+    buttons: [
+      { text: "Поставить", callback_data: "Поставить" },
+      { text: "Не надо", callback_data: "Не надо" },
+    ],
+  },
+];
+const richChoice = { rich_message: { blocks: choiceBlocks } };
+/** Текст хода по тапу под choiceBlocks: data и текст сообщения с кнопкой. */
+const choiceTurn = (data: string) =>
+  `${data}\n\n(кнопка под сообщением Ивы: «Поставить плагин?»)`;
+
+function tapDeps() {
+  const recorded = recordingDeps();
+  const edits: Array<[number, number, unknown]> = [];
+  const scheduled: string[] = [];
+  const result = { edit: true };
+  return {
+    ...recorded,
+    edits,
+    scheduled,
+    result,
+    deps: {
+      ...recorded.deps,
+      scheduleImpl: (key: string, task: () => Promise<void>) => {
+        scheduled.push(key);
+        void task();
+        return true;
+      },
+      editTapImpl: async (chatId: number, messageId: number, edit: unknown) => {
+        edits.push([chatId, messageId, edit]);
+        return result.edit;
+      },
+    },
+  };
+}
+
+test("a model button tap shows ✅ with its label and marks the button in the rich message", async () => {
+  const { acks, edits, scheduled, deps } = tapDeps();
+  const update = modelTap(301, 501, "Не надо", {
+    rich_message: { blocks: choiceBlocks, is_rtl: false },
+  });
+
+  assert.equal(await handleControl(update, deps), false, "the tap goes on");
+  await flush();
+
+  assert.equal(
+    (update.message as { text?: string }).text,
+    choiceTurn("Не надо"),
+  );
+  assert.deepEqual(acks, [["cq-301", "✅ Не надо"]]);
+  assert.deepEqual(scheduled, ["tap:7:501:Не надо"]);
+  assert.deepEqual(edits, [
+    [
+      7,
+      501,
+      {
+        rich: {
+          blocks: [
+            choiceBlocks[0],
+            {
+              type: "buttons",
+              buttons: [
+                { text: "Поставить", callback_data: "Поставить" },
+                {
+                  text: "✅ Не надо",
+                  style: "success",
+                  callback_data: "Не надо",
+                },
+              ],
+            },
+          ],
+          is_rtl: false,
+        },
+      },
+    ],
+  ]);
+});
+
+// Владелец передумал раньше, чем легла первая правка: снимок второго апдейта ещё без «✅».
+// Правка второй кнопки несёт и первую отметку, иначе легшая последней правка её стирает.
+test("a second button of the same message keeps the first button's mark in its edit", async () => {
+  const { edits, deps } = tapDeps();
+  assert.equal(
+    await handleControl(modelTap(321, 521, "Не надо", richChoice), deps),
+    false,
+  );
+  assert.equal(
+    await handleControl(modelTap(322, 521, "Поставить", richChoice), deps),
+    false,
+  );
+  await flush();
+
+  assert.equal(edits.length, 2);
+  assert.deepEqual(
+    (edits[1][2] as { rich: { blocks: unknown[] } }).rich.blocks[1],
+    {
+      type: "buttons",
+      buttons: [
+        { text: "✅ Поставить", style: "success", callback_data: "Поставить" },
+        { text: "✅ Не надо", style: "success", callback_data: "Не надо" },
+      ],
+    },
+  );
+});
+
+test("a second tap on the same button by another update is «already chosen» and no message", async () => {
+  const { acks, edits, deps } = tapDeps();
+  assert.equal(
+    await handleControl(modelTap(311, 511, "Не надо", richChoice), deps),
+    false,
+  );
+  const second = modelTap(312, 511, "Не надо", richChoice);
+
+  assert.equal(await handleControl(second, deps), true, "the tap is consumed");
+  await flush();
+
+  assert.equal(second.message, undefined, "no second message");
+  assert.ok(second.callback_query);
+  assert.deepEqual(acks, [
+    ["cq-311", "✅ Не надо"],
+    ["cq-312", "Уже выбрано"],
+  ]);
+  assert.equal(edits.length, 1);
+
+  // Другие кнопки того же сообщения живые: владелец вправе передумать.
+  const other = modelTap(313, 511, "Поставить", richChoice);
+  assert.equal(await handleControl(other, deps), false);
+  assert.equal(
+    (other.message as { text?: string }).text,
+    choiceTurn("Поставить"),
+  );
+});
+
+test("the same update handed out again after write-failed passes as fresh", async () => {
+  const { acks, deps } = tapDeps();
+  const first = modelTap(321, 521, "Не надо", richChoice);
+  const again = modelTap(321, 521, "Не надо", richChoice);
+
+  assert.equal(await handleControl(first, deps), false);
+  assert.equal(
+    await handleControl(again, deps),
+    false,
+    "admission gets it again",
+  );
+
+  assert.equal(
+    (again.message as { text?: string }).text,
+    choiceTurn("Не надо"),
+  );
+  assert.ok(!acks.some(([, text]) => text === "Уже выбрано"));
+});
+
+test("a tap that cannot become a message is not marked and not remembered", async () => {
+  const { acks, edits, scheduled, deps } = tapDeps();
+  // Дробная дата не проходит валидатор очереди: applyTelegramButtonTap отдаёт false.
+  const broken = modelTap(331, 531, "Не надо", { ...richChoice, date: 1.5 });
+
+  assert.equal(await handleControl(broken, deps), true);
+  await flush();
+  assert.deepEqual(acks, [["cq-331", undefined]]);
+  assert.deepEqual(scheduled, []);
+  assert.deepEqual(edits, []);
+
+  const next = modelTap(332, 531, "Не надо", richChoice);
+  assert.equal(await handleControl(next, deps), false, "no key was kept");
+  assert.equal((next.message as { text?: string }).text, choiceTurn("Не надо"));
+});
+
+test("a failed edit keeps the key: the next tap is still «already chosen»", async () => {
+  const { acks, edits, result, deps } = tapDeps();
+  result.edit = false;
+
+  assert.equal(
+    await handleControl(modelTap(341, 541, "Не надо", richChoice), deps),
+    false,
+  );
+  await flush();
+  assert.equal(edits.length, 1);
+
+  const third = modelTap(342, 541, "Не надо", richChoice);
+  assert.equal(await handleControl(third, deps), true);
+  assert.equal(third.message, undefined);
+  assert.deepEqual(acks.at(-1), ["cq-342", "Уже выбрано"]);
+});
+
+test("an inaccessible message, one without buttons or with media gets only the hint and still remembers", async () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["inaccessible", { date: 0 }],
+    ["no tree", { text: "Поставить?" }],
+    [
+      "media",
+      {
+        rich_message: {
+          blocks: [{ type: "photo", photo: [] }, ...choiceBlocks],
+        },
+      },
+    ],
+    ["no button", { rich_message: { blocks: [choiceBlocks[0]] } }],
+  ];
+  let id = 350;
+  for (const [label, message] of cases) {
+    const { acks, edits, scheduled, deps } = tapDeps();
+    id += 2;
+    assert.equal(
+      await handleControl(modelTap(id, id, "Не надо", message), deps),
+      false,
+      label,
+    );
+    await flush();
+    assert.deepEqual(acks, [[`cq-${id}`, "✅ Не надо"]], label);
+    assert.deepEqual(scheduled, [], label);
+    assert.deepEqual(edits, [], label);
+
+    const second = modelTap(id + 1, id, "Не надо", message);
+    assert.equal(await handleControl(second, deps), true, label);
+    assert.equal(second.message, undefined, label);
+  }
+});
+
+test("a rejected callback answer does not stop the tap: it is a message and remembered", async () => {
+  const { deps } = tapDeps();
+  const failingAck = {
+    ...deps,
+    ackImpl: async () => {
+      throw new Error("query is too old");
+    },
+  };
+  const update = modelTap(371, 571, "Не надо", richChoice);
+
+  assert.equal(await handleControl(update, failingAck), false);
+  assert.equal(
+    (update.message as { text?: string }).text,
+    choiceTurn("Не надо"),
+  );
+  assert.equal(
+    await handleControl(modelTap(372, 571, "Не надо", richChoice), failingAck),
+    true,
+    "the key was kept",
+  );
+});
+
+test("a stranger's tap and a group tap are neither marked nor remembered", async () => {
+  const { acks, edits, scheduled, deps } = tapDeps();
+  const stranger = modelTap(381, 581, "Не надо", richChoice);
+  (stranger.callback_query as Record<string, unknown>).from = {
+    id: 999,
+    is_bot: false,
+  };
+  const group = modelTap(382, 582, "Не надо", {
+    ...richChoice,
+    chat: { id: -1001, type: "supergroup" },
+  });
+
+  assert.equal(await handleControl(stranger, deps), false);
+  assert.equal(await handleControl(group, deps), true);
+  await flush();
+
+  assert.deepEqual(acks[0], ["cq-381", undefined]);
+  assert.match(acks[1][1] ?? "", /личн/u);
+  assert.deepEqual(scheduled, []);
+  assert.deepEqual(edits, []);
+  // Ни один из них не оставил ключа: тап владельца по той же кнопке — свежий.
+  const owner = modelTap(383, 581, "Не надо", richChoice);
+  assert.equal(await handleControl(owner, deps), false);
+});
+
+test("tap memory keeps the first button after 256, 1000 and 3000 other taps", async () => {
+  const { deps } = tapDeps();
+  assert.equal(await handleControl(modelTap(10_000, 10_000, "x"), deps), false);
+  for (let i = 1; i <= 3000; i += 1) {
+    assert.equal(
+      await handleControl(modelTap(10_000 + i, 10_000 + i, "x"), deps),
+      false,
+    );
+    if (i === 256 || i === 300 || i === 1000 || i === 3000) {
+      const again = modelTap(20_000 + i, 10_000, "x");
+      assert.equal(
+        await handleControl(again, deps),
+        true,
+        `first key after ${i} other taps`,
+      );
+      assert.equal(again.message, undefined);
+    }
+  }
+  assert.equal(
+    await handleControl(modelTap(10_000, 10_000, "x"), deps),
+    false,
+    "same failed-admission update remains retryable",
+  );
+});
+
+test("a tap handed out again while its edit is in flight schedules no second edit", async () => {
+  const { deps } = tapDeps();
+  let release = () => {};
+  const edits: unknown[] = [];
+  const slow = {
+    ...deps,
+    scheduleImpl: undefined,
+    editTapImpl: (_chat: number, _message: number, edit: unknown) => {
+      edits.push(edit);
+      return new Promise<boolean>((resolve) => {
+        release = () => resolve(true);
+      });
+    },
+  };
+
+  assert.equal(
+    await handleControl(modelTap(391, 591, "Не надо", richChoice), slow),
+    false,
+  );
+  assert.equal(
+    await handleControl(modelTap(391, 591, "Не надо", richChoice), slow),
+    false,
+  );
+  assert.equal(edits.length, 1, "the key is still in flight");
+  release();
+  await flush();
+});
+
+// ── «Установить»: пометка только после запуска установщика ──
+
+function proposalTap(
+  updateId: number,
+  messageId: number,
+  message: Record<string, unknown>,
+): ControlUpdate {
+  return modelTap(updateId, messageId, "iva_plugin:ok:0123456789ab", message);
+}
+
+const installRow = [
+  { text: "Установить", callback_data: "iva_plugin:ok:0123456789ab" },
+];
+const classicProposal = { reply_markup: { inline_keyboard: [installRow] } };
+const richProposal = {
+  rich_message: {
+    blocks: [
+      { type: "paragraph", text: "Плагин relay" },
+      { type: "buttons", buttons: installRow },
+    ],
+  },
+};
+const installMarked = {
+  text: "✅ Установить",
+  style: "success",
+  callback_data: "iva_plugin:ok:0123456789ab",
+};
+
+function proposalDeps(outcome: string) {
+  const recorded = tapDeps();
+  const taps: unknown[] = [];
+  return {
+    ...recorded,
+    taps,
+    deps: {
+      ...recorded.deps,
+      pluginTapImpl: async (tap: unknown) => {
+        taps.push(tap);
+        return outcome;
+      },
+    },
+  };
+}
+
+test("«Install» that started marks the button: classic by default, rich too; a second tap is «already chosen»", async () => {
+  const expected: Array<[string, Record<string, unknown>, unknown]> = [
+    ["classic", classicProposal, { inline_keyboard: [[installMarked]] }],
+    [
+      "rich",
+      richProposal,
+      {
+        rich: {
+          blocks: [
+            { type: "paragraph", text: "Плагин relay" },
+            { type: "buttons", buttons: [installMarked] },
+          ],
+        },
+      },
+    ],
+  ];
+  let id = 400;
+  for (const [label, message, edit] of expected) {
+    const { acks, edits, taps, deps } = proposalDeps("started");
+    id += 2;
+    assert.equal(
+      await handleControl(proposalTap(id, id, message), deps),
+      true,
+      label,
+    );
+    await flush();
+    assert.deepEqual(edits, [[7, id, edit]], label);
+
+    assert.equal(
+      await handleControl(proposalTap(id + 1, id, message), deps),
+      true,
+      label,
+    );
+    assert.equal(taps.length, 1, `${label}: the installer runs once`);
+    assert.deepEqual(acks, [
+      [`cq-${id}`, undefined],
+      [`cq-${id + 1}`, "Уже выбрано"],
+    ]);
+  }
+});
+
+test("«Install» that did not start or is stale stays live and is not marked", async () => {
+  let id = 420;
+  for (const outcome of ["not-started", "stale"]) {
+    const { edits, scheduled, taps, deps } = proposalDeps(outcome);
+    id += 2;
+    await handleControl(proposalTap(id, id, classicProposal), deps);
+    await handleControl(proposalTap(id + 1, id, classicProposal), deps);
+    await flush();
+    assert.deepEqual(edits, [], outcome);
+    assert.deepEqual(scheduled, [], outcome);
+    assert.equal(
+      taps.length,
+      2,
+      `${outcome}: the second tap reaches the installer again`,
+    );
+  }
+});
+
+// Граница с Telegram: какой метод и какое тело уходят на провод, и что считается успехом.
+// Правка идёт настоящим путём моста (фон и транспорт), подменён только fetch.
+test("the edit goes on the wire as editMessageText with blocks or editMessageReplyMarkup", async () => {
+  const realFetch = globalThis.fetch;
+  const realLog = console.log;
+  const calls: Array<[string, Record<string, unknown>]> = [];
+  const lines: string[] = [];
+  const replies: Array<Record<string, unknown>> = [
+    { ok: true, result: {} },
+    { ok: true, result: true },
+    { ok: false, description: "Bad Request: message is not modified" },
+    { ok: false, description: "Bad Request: message can't be edited" },
+  ];
+  globalThis.fetch = (async (url: string, init: { body: string }) => {
+    calls.push([url, JSON.parse(init.body) as Record<string, unknown>]);
+    return new Response(JSON.stringify(replies[calls.length - 1]));
+  }) as typeof fetch;
+  console.log = (...parts: unknown[]) => {
+    lines.push(parts.slice(1).join(" "));
+  };
+  const { deps } = recordingDeps();
+  const tap = async (id: number, message: Record<string, unknown>) => {
+    await handleControl(proposalTap(id, id, message), {
+      ...deps,
+      pluginTapImpl: async () => "started",
+    });
+    for (let i = 0; i < 5; i += 1) await flush();
+  };
+  try {
+    await tap(601, {
+      rich_message: { ...richProposal.rich_message, is_rtl: true },
+    });
+    await tap(602, classicProposal);
+    await tap(603, classicProposal);
+    await tap(604, classicProposal);
+  } finally {
+    globalThis.fetch = realFetch;
+    console.log = realLog;
+  }
+
+  assert.equal(calls.length, 4);
+  assert.match(calls[0][0], /\/editMessageText$/u);
+  assert.deepEqual(calls[0][1], {
+    chat_id: 7,
+    message_id: 601,
+    rich_message: {
+      blocks: [
+        { type: "paragraph", text: "Плагин relay" },
+        { type: "buttons", buttons: [installMarked] },
+      ],
+      is_rtl: true,
+    },
+  });
+  assert.match(calls[1][0], /\/editMessageReplyMarkup$/u);
+  assert.deepEqual(calls[1][1], {
+    chat_id: 7,
+    message_id: 602,
+    reply_markup: { inline_keyboard: [[installMarked]] },
+  });
+  const verdicts = lines.filter((line) => line.startsWith("tap mark"));
+  assert.deepEqual(verdicts, [
+    "tap marked 7:601 editMessageText",
+    "tap marked 7:602 editMessageReplyMarkup",
+    "tap marked 7:603 editMessageReplyMarkup",
+    "tap mark failed 7:604 editMessageReplyMarkup",
+  ]);
+});
+
+// ── «Я в курсе» под пунктом Watch: путь кода в мосте, модель не будится ─────────────────────
+const SEED = Number(process.env.FC_SEED ?? Date.now() % 2 ** 31);
+const watchItem = {
+  rich_message: {
+    blocks: [
+      { type: "paragraph", text: "Иван ждёт ответа про договор." },
+      {
+        type: "buttons",
+        buttons: [{ text: "Я в курсе", callback_data: "Я в курсе: Иван" }],
+      },
+    ],
+  },
+};
+
+function gotItDeps(result: boolean | Error = true) {
+  const { acks, replies, deps } = tapDeps();
+  const deletes: Array<[number, number]> = [];
+  return {
+    acks,
+    replies,
+    deletes,
+    deps: {
+      ...deps,
+      deleteImpl: async (chatId: number, messageId: number) => {
+        deletes.push([chatId, messageId]);
+        if (result instanceof Error) throw result;
+        return result;
+      },
+    },
+  };
+}
+
+/** Модель не будится: апдейт не стал сообщением, колбэк остался колбэком. */
+function modelNotWoken(update: ControlUpdate): void {
+  assert.equal(update.message, undefined, "the tap became a message");
+  assert.ok(update.callback_query, "the callback was rewritten");
+}
+
+test("«Я в курсе: Иван» deletes the Watch message, shows ✅ and never reaches the model", async () => {
+  const { acks, deletes, replies, deps } = gotItDeps();
+  const update = modelTap(701, 801, "Я в курсе: Иван", watchItem);
+
+  assert.equal(await handleControl(update, deps), true, "consumed");
+  await flush();
+
+  modelNotWoken(update);
+  assert.deepEqual(deletes, [[7, 801]]);
+  assert.deepEqual(acks, [["cq-701", "✅ Я в курсе"]]);
+  assert.deepEqual(replies, [], "no message in the chat");
+});
+
+test("a second «Я в курсе» on the deleted message is a hint, no second delete, no model", async () => {
+  const { acks, deletes, deps } = gotItDeps();
+  await handleControl(modelTap(711, 811, "Я в курсе: Иван", watchItem), deps);
+  const again = modelTap(712, 811, "Я в курсе: Иван", watchItem);
+
+  assert.equal(await handleControl(again, deps), true);
+  modelNotWoken(again);
+  assert.deepEqual(deletes, [[7, 811]]);
+  assert.deepEqual(acks.at(-1), ["cq-712", "Уже убрано"]);
+
+  // Память моста пуста (рестарт): Telegram уже не находит сообщение — подсказка, без падения.
+  const gone = gotItDeps(false);
+  const late = modelTap(713, 812, "Я в курсе: Иван", watchItem);
+  assert.equal(await handleControl(late, gone.deps), true);
+  modelNotWoken(late);
+  assert.deepEqual(gone.acks, [["cq-713", "Не смогла удалить сообщение"]]);
+});
+
+test("a refused or failed deleteMessage gives the «could not delete» hint and nothing else", async () => {
+  for (const result of [false, new Error("network down")]) {
+    const { acks, deletes, replies, deps } = gotItDeps(result);
+    const update = modelTap(721, 821, "Я в курсе: Иван", watchItem);
+
+    assert.equal(await handleControl(update, deps), true);
+    await flush();
+
+    modelNotWoken(update);
+    assert.deepEqual(deletes, [[7, 821]]);
+    assert.deepEqual(acks, [["cq-721", "Не смогла удалить сообщение"]]);
+    assert.deepEqual(replies, []);
+  }
+  // Отказ не запомнен: следующий тап снова пробует удалить.
+  const { deletes, deps } = gotItDeps(true);
+  await handleControl(modelTap(722, 821, "Я в курсе: Иван", watchItem), deps);
+  assert.deepEqual(deletes, [[7, 821]]);
+});
+
+test("«Я в курсе» from a stranger or from a group deletes nothing and never reaches the model", async () => {
+  const stranger = gotItDeps();
+  const update = modelTap(731, 831, "Я в курсе: Иван", watchItem);
+  (update.callback_query as { from: unknown }).from = { id: 99, is_bot: false };
+  assert.equal(await handleControl(update, stranger.deps), true);
+  modelNotWoken(update);
+  assert.deepEqual(stranger.deletes, []);
+  assert.deepEqual(stranger.acks, [["cq-731", undefined]]);
+
+  const group = gotItDeps();
+  const inGroup = modelTap(732, 832, "Я в курсе: Иван", {
+    ...watchItem,
+    chat: { id: -100, type: "supergroup" },
+  });
+  assert.equal(await handleControl(inGroup, group.deps), true);
+  modelNotWoken(inGroup);
+  assert.deepEqual(group.deletes, []);
+  assert.deepEqual(group.acks, [
+    ["cq-732", "Открой личный чат со мной, чтобы использовать это управление."],
+  ]);
+});
+
+test("the default deleteImpl calls deleteMessage on the wire; a refusal is the hint", async () => {
+  const realFetch = globalThis.fetch;
+  const calls: Array<[string, Record<string, unknown>]> = [];
+  const replies: unknown[] = [
+    { ok: true, result: true },
+    { ok: false, description: "Bad Request: message can't be deleted" },
+  ];
+  globalThis.fetch = (async (url: string, init: { body: string }) => {
+    calls.push([url, JSON.parse(init.body) as Record<string, unknown>]);
+    return new Response(JSON.stringify(replies[calls.length - 1]));
+  }) as typeof fetch;
+  const { acks, deps } = recordingDeps();
+  try {
+    await handleControl(modelTap(741, 841, "Я в курсе: Иван", watchItem), deps);
+    await handleControl(modelTap(742, 842, "Я в курсе: Иван", watchItem), deps);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(calls.length, 2);
+  assert.match(calls[0][0], /\/deleteMessage$/u);
+  assert.deepEqual(calls[0][1], { chat_id: 7, message_id: 841 });
+  assert.deepEqual(acks, [
+    ["cq-741", "✅ Я в курсе"],
+    ["cq-742", "Не смогла удалить сообщение"],
+  ]);
+});
+
+/** Язык владельца на время теста: settings.json и сдвиг часов мимо кэша getLang (2 с). */
+async function inLanguage<T>(language: string, work: () => Promise<T>) {
+  const realNow = Date.now;
+  const settings = join(dataDir, "settings.json");
+  const write = (lang: string, shift: number) => {
+    writeFileSync(
+      settings,
+      JSON.stringify({ menuStyle: "rich", language: lang }),
+    );
+    Date.now = () => realNow() + shift;
+  };
+  write(language, 10_000);
+  try {
+    return await work();
+  } finally {
+    write("ru", 20_000);
+    await handleControl(modelTap(1, 1, "iva_noop"), recordingDeps().deps);
+    Date.now = realNow;
+  }
+}
+
+test("an English owner's «Got it: Ivan» is the bridge's; the Russian words then go to the model", async () => {
+  await inLanguage("en", async () => {
+    const { acks, deletes, deps } = gotItDeps();
+    const update = modelTap(751, 851, "Got it: Ivan", watchItem);
+    assert.equal(await handleControl(update, deps), true);
+    modelNotWoken(update);
+    assert.deepEqual(deletes, [[7, 851]]);
+    assert.deepEqual(acks, [["cq-751", "✅ Got it"]]);
+
+    const russian = modelTap(752, 852, "Я в курсе: Иван", watchItem);
+    assert.equal(await handleControl(russian, deps), false);
+    assert.equal(
+      (russian.message as { text?: string }).text,
+      "Я в курсе: Иван\n\n(button under Iva's message: «Иван ждёт ответа про договор.»)",
+    );
+    assert.deepEqual(deletes, [[7, 851]]);
+  });
+});
+
+test(`property: only the exact «Я в курсе: <name>» stays in the bridge; any other data reaches the model (seed ${SEED})`, async () => {
+  const PREFIX = "Я в курсе: ";
+  const oracle = (data: string) =>
+    data.startsWith(PREFIX) && data.slice(PREFIX.length).trim() !== "";
+  const name = fc.oneof(
+    fc.string({ maxLength: 40 }),
+    fc.constantFrom('"Иван"', "«Иван»", "Иван ".repeat(20), " ", "\t", ""),
+  );
+  const data = fc.oneof(
+    name.map((n) => PREFIX + n),
+    fc
+      .tuple(
+        fc.constantFrom(
+          "я в курсе: ",
+          "Я в курсе:",
+          "Я в курсе : ",
+          " Я в курсе: ",
+          "Я  в курсе: ",
+          "Я в курсе ",
+          "Got it: ",
+          "В задачи: ",
+          "Позже: ",
+          "«Я в курсе: ",
+        ),
+        name,
+      )
+      .map(([p, n]) => p + n),
+    fc.string({ maxLength: 60 }),
+  );
+  let id = 10_000;
+  await fc.assert(
+    fc.asyncProperty(
+      data.filter(
+        (d) => d.trim() !== "" && !d.startsWith("iva_") && !d.startsWith("eve"),
+      ),
+      async (d) => {
+        id += 1;
+        const { deletes, deps } = gotItDeps();
+        const update = modelTap(id, id, d, watchItem);
+        const consumed = await handleControl(update, deps);
+        if (oracle(d)) {
+          assert.equal(consumed, true);
+          modelNotWoken(update);
+          assert.deepEqual(deletes, [[7, id]]);
+          return;
+        }
+        assert.deepEqual(deletes, [], `deleted for ${JSON.stringify(d)}`);
+        assert.equal(
+          consumed,
+          false,
+          `kept from the model: ${JSON.stringify(d)}`,
+        );
+        assert.equal(
+          (update.message as { text?: string }).text,
+          `${d}\n\n(кнопка под сообщением Ивы: «Иван ждёт ответа про договор.»)`,
+        );
+      },
+    ),
+    { seed: SEED, numRuns: 300 },
+  );
+});
+
+// ── Тап несёт текст сообщения с кнопкой (дефект 07.10.2026) ─────────────────────────────────
+// Обзор с одной кнопкой «Составить ответ»: по нажатию модель получила только data и пошла
+// искать, кому и о чём. Теперь ход получает и текст сообщения, под которым стояла кнопка.
+
+const tapText = (update: ControlUpdate) =>
+  (update.message as { text?: string }).text;
+
+test("a tap under a plain message carries the message text to the turn", async () => {
+  const { deps } = tapDeps();
+  const update = modelTap(901, 1901, "Составить ответ", {
+    text: "Юрий спрашивает про смету на ремонт. Составить ответ Юрию?",
+  });
+
+  assert.equal(await handleControl(update, deps), false);
+  assert.equal(
+    tapText(update),
+    "Составить ответ\n\n(кнопка под сообщением Ивы: «Юрий спрашивает про смету на ремонт. Составить ответ Юрию?»)",
+  );
+});
+
+test("a tap under a rich message carries paragraphs, lists and tables, not the buttons", async () => {
+  const { deps } = tapDeps();
+  const update = modelTap(911, 1911, "Ответить: Юрий, смета", {
+    rich_message: {
+      blocks: [
+        { type: "paragraph", text: "Юрий спрашивает про смету." },
+        {
+          type: "list",
+          items: [
+            { blocks: [{ type: "paragraph", text: "срок пятница" }] },
+            { blocks: [{ type: "paragraph", text: "сумма 120 000" }] },
+          ],
+        },
+        {
+          type: "table",
+          cells: [
+            [{ text: "Кто" }, { text: "Что" }],
+            [{ text: "Юрий" }, { text: "смета" }],
+          ],
+        },
+        {
+          type: "buttons",
+          buttons: [
+            {
+              text: "Составить ответ",
+              callback_data: "Ответить: Юрий, смета",
+            },
+          ],
+        },
+      ],
+    },
+  });
+
+  assert.equal(await handleControl(update, deps), false);
+  const text = tapText(update) as string;
+  assert.ok(
+    text.startsWith("Ответить: Юрий, смета\n\n(кнопка под сообщением Ивы: «"),
+  );
+  for (const part of [
+    "Юрий спрашивает про смету.",
+    "срок пятница",
+    "сумма 120 000",
+    "Юрий",
+    "смета",
+  ])
+    assert.ok(text.includes(part), part);
+  assert.ok(!text.includes("Составить ответ"), "button labels stay out");
+  assert.ok(text.endsWith("»)"));
+});
+
+test("a tap under a message without text is the data alone, as before", async () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["inaccessible", { date: 0 }],
+    ["blank text", { text: "   " }],
+    ["buttons only", { rich_message: { blocks: [choiceBlocks[1]] } }],
+    ["no blocks", { rich_message: {} }],
+    ["garbage blocks", { rich_message: { blocks: [null, 5, "", {}] } }],
+  ];
+  let id = 920;
+  for (const [label, message] of cases) {
+    const { deps } = tapDeps();
+    id += 1;
+    const update = modelTap(id, 1000 + id, "Не надо", message);
+    assert.equal(await handleControl(update, deps), false, label);
+    assert.equal(tapText(update), "Не надо", label);
+  }
+});
+
+test("a long message text is cut to the limit with a mark at the end", async () => {
+  const { deps } = tapDeps();
+  const long = "смета ".repeat(600);
+  const update = modelTap(931, 1931, "Составить ответ", { text: long });
+
+  assert.equal(await handleControl(update, deps), false);
+  const context = tapContextText({ text: long });
+  assert.equal(Array.from(context).length <= TAP_CONTEXT_LIMIT, true);
+  assert.ok(context.endsWith(" […обрезано]"), context.slice(-30));
+  assert.ok(long.startsWith(context.slice(0, -" […обрезано]".length)));
+  assert.equal(
+    tapText(update),
+    `Составить ответ\n\n(кнопка под сообщением Ивы: «${context}»)`,
+  );
+  // Ровно на пределе текст не режется.
+  const exact = "я".repeat(TAP_CONTEXT_LIMIT);
+  assert.equal(tapContextText({ text: exact }), exact);
+});
+
+test(`property: the message text for a tap never throws and never exceeds the limit (seed ${SEED})`, () => {
+  const leaf = fc.oneof(
+    fc.string({ maxLength: 400 }),
+    fc.string({ unit: "grapheme", maxLength: 400 }),
+    fc.constantFrom(
+      "",
+      " ",
+      "# заголовок",
+      "[ссылка](javascript:x)",
+      "a".repeat(5000),
+    ),
+  );
+  const block = fc.letrec((tie) => ({
+    node: fc.oneof(
+      { depthSize: "small" },
+      leaf.map((text) => ({ type: "paragraph", text })),
+      fc.array(tie("node"), { maxLength: 4 }).map((items) => ({
+        type: "list",
+        items: items.map((b) => ({ blocks: [b] })),
+      })),
+      fc
+        .array(fc.array(leaf, { maxLength: 4 }), { maxLength: 4 })
+        .map((rows) => ({
+          type: "table",
+          cells: rows.map((row) => row.map((text) => ({ text }))),
+        })),
+      fc.constant({
+        type: "buttons",
+        buttons: [{ text: "x", callback_data: "x" }],
+      }),
+      fc.anything(),
+    ),
+  })).node;
+  const message = fc.oneof(
+    fc.record({ text: leaf }),
+    fc.record({
+      rich_message: fc.record({ blocks: fc.array(block, { maxLength: 8 }) }),
+    }),
+    fc.record({ rich_message: fc.anything() }),
+    fc.dictionary(fc.string(), fc.anything()),
+  );
+  fc.assert(
+    fc.property(message, (m) => {
+      const context = tapContextText(m);
+      assert.equal(typeof context, "string");
+      assert.ok(Array.from(context).length <= TAP_CONTEXT_LIMIT);
+    }),
+    { seed: SEED, numRuns: 300 },
+  );
+});
+
+// Первый запрос хода оборвался посреди ответа: в истории сессии вопроса нет, и модель
+// узнаёт его только из текста нажатия «Повторить» — сообщение об обрыве цитирует вопрос.
+// Цепочка целиком: текст канала → сообщение, как его вернёт Telegram → мост → ход eve с
+// пустой историей.
+test("a Try again tap after a first-request break brings the question to an empty history", async () => {
+  const { telegramFailureMessage } =
+    await import("#lib/telegram-failure-notice.ts");
+  // Вопрос длиннее цитаты (120 знаков): модель обязана получить его целиком, а не цитату.
+  const question = `Сколько стоит *ремонт* кухни в Ташкенте? ${"подробности ".repeat(30)}КОНЕЦ-ВОПРОСА`;
+  const { rememberTurnQuestion } = await import("#lib/turn-question.ts");
+  rememberTurnQuestion("7:", { text: question, media: false });
+  const failure = telegramFailureMessage(
+    {
+      message: "terminated",
+      details: { errorId: "e-1", attempts: 1, answerStarted: true },
+      question,
+    },
+    "claude",
+  );
+  const [shown = ""] = failure.split("\n\n<tg-button-row>");
+  const data = /data="([^"]+)"/u.exec(failure)?.[1] ?? "";
+  assert.equal(data, "Повторить");
+  // Telegram отдаёт rich-сообщение блоками: абзац уже без экранирования разметки.
+  const update = modelTap(931, 1931, data, {
+    rich_message: {
+      blocks: [
+        { type: "paragraph", text: shown.replace(/\\(.)/gu, "$1") },
+        { type: "buttons", buttons: [{ text: data, callback_data: data }] },
+      ],
+    },
+  });
+  const { deps } = tapDeps();
+  assert.equal(await handleControl(update, deps), false);
+  const turnText = (update.message as { text?: string }).text ?? "";
+  assert.ok(turnText.startsWith("Повторить\n\n(кнопка под сообщением Ивы: «"));
+
+  const { MockLanguageModelV4, convertArrayToReadableStream } =
+    await import("ai/test");
+  const { createToolLoopHarness } =
+    await import("../../node_modules/eve/dist/src/harness/tool-loop.js");
+  const prompts: string[] = [];
+  const model = new MockLanguageModelV4({
+    doStream: (options) => {
+      prompts.push(JSON.stringify(options.prompt));
+      return Promise.resolve({
+        stream: convertArrayToReadableStream([
+          { type: "text-start", id: "t" },
+          { type: "text-delta", id: "t", delta: "ok" },
+          { type: "text-end", id: "t" },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: {
+              inputTokens: {
+                total: 1,
+                noCache: 1,
+                cacheRead: 0,
+                cacheWrite: 0,
+              },
+              outputTokens: { total: 1, text: 1, reasoning: 0 },
+            },
+          },
+        ]),
+      });
+    },
+  });
+  const step = createToolLoopHarness({
+    mode: "conversation",
+    tools: new Map(),
+    resolveModel: () => Promise.resolve(model),
+    handleEvent: () => Promise.resolve(),
+  });
+  const result = await step(
+    {
+      agent: { system: "Ты Ива.", tools: [], modelReference: { id: "t/m" } },
+      compaction: { threshold: 100_000, recentWindowSize: 100 },
+      continuationToken: "t",
+      sessionId: "t",
+      history: [],
+    },
+    { message: turnText },
+  );
+  assert.equal(result.settledTurn?.output, "ok");
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0]?.includes(question), prompts[0]);
+});
+
+// Своя кнопка модели с той же подписью под другим сообщением вопрос не подставляет: это
+// реплика владельца, а не нажатие под сообщением об обрыве.
+test("a model's own «Повторить» button under another message brings no stored question", async () => {
+  const { rememberTurnQuestion } = await import("#lib/turn-question.ts");
+  rememberTurnQuestion("7:", { text: "СКРЫТЫЙ-ВОПРОС", media: false });
+  const update = modelTap(932, 1932, "Повторить", {
+    text: "Отправить письмо Юрию ещё раз?",
+  });
+  const { deps } = tapDeps();
+  assert.equal(await handleControl(update, deps), false);
+  const turnText = (update.message as { text?: string }).text ?? "";
+  assert.doesNotMatch(turnText, /СКРЫТЫЙ-ВОПРОС/u);
+});
+
+test("native stop is handled before admission and leaves the next turn and compaction alone", async () => {
+  runningTurn();
+  const { cancels, replies, acks, deps } = recordingDeps();
+  assert.equal(await handleControl(nativeStop(), deps), true);
+  assert.equal(cancels.length, 1);
+  runningTurn({ turnId: "turn-new", draftId: 42 });
+  assert.equal(await handleControl(nativeStop(), deps), true);
+  assert.equal(cancels.length, 1);
+  runningTurn({ turnId: null, draftId: 41, compacting: true });
+  assert.equal(await handleControl(nativeStop(), deps), true);
+  assert.equal(cancels.length, 1);
+  assert.deepEqual(replies, []);
+  assert.deepEqual(acks, []);
 });

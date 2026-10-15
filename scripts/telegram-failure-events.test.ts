@@ -1,18 +1,10 @@
 /* eslint-disable @typescript-eslint/no-floating-promises -- Node's test runner owns registrations. */
 import "./lib/ts-esm-hooks.ts";
 import assert from "node:assert/strict";
-import {
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
-import type { ChannelSource, RouteHandlerArgs, Session } from "eve/channels";
-import type { TelegramChannelState } from "eve/channels/telegram";
 
 const dataDir = mkdtempSync(join(tmpdir(), "iva-telegram-failures-"));
 process.env.ASSISTANT_DATA_DIR = dataDir;
@@ -37,6 +29,7 @@ type HeldSend = {
 type EventOptions = {
   chatId: string;
   sessionId: string;
+  chatType?: string;
 };
 type ChannelEventHandler = (
   data: Record<string, unknown>,
@@ -66,6 +59,7 @@ type FailureAdapter = {
     context: unknown,
   ) => void | Promise<void>;
   "turn.started": ChannelEventHandler;
+  "input.resolved": ChannelEventHandler;
   "actions.requested": ChannelEventHandler;
   "action.partial": ChannelEventHandler;
   "action.result": ChannelEventHandler;
@@ -74,10 +68,9 @@ type FailureAdapter = {
 };
 
 const apiCalls: ApiCall[] = [];
-const hitlResponses: unknown[][] = [];
 let heldSend: HeldSend | undefined;
 // Ответ cancel-роута для следующего теста: обычно ход действительно отменяется.
-let cancelRouteStatus: "accepted" | "no_active_turn" = "accepted";
+const cancelRouteStatus: "accepted" | "no_active_turn" = "accepted";
 globalThis.fetch = async (url, init = {}) => {
   // eslint-disable-next-line @typescript-eslint/no-base-to-string -- preserve the original mock's exact String coercion.
   const requestUrl = String(url);
@@ -92,7 +85,6 @@ globalThis.fetch = async (url, init = {}) => {
   // Самовызов cancel-роута каналом (кнопка ⏹ Стоп в webhook-режиме) — не Bot API.
   if (requestUrl.endsWith("/eve/v1/telegram/cancel")) {
     const status = cancelRouteStatus;
-    if (status === "accepted") finishCancelledTurn(body?.sessionId);
     return Response.json({ ok: true, status });
   }
   const hold = heldSend;
@@ -112,7 +104,7 @@ globalThis.fetch = async (url, init = {}) => {
 
 const telegramTestModule = "../agent/channels/telegram.ts?failure-events-test";
 const [
-  { default: channel },
+  { default: channel, rememberAccepted },
   { chatKeyOf, getChatStatus, setChatStatus },
   { ContextContainer, contextStorage },
   { SessionKey },
@@ -129,22 +121,14 @@ const adapter = (channel as unknown as { adapter: FailureAdapter }).adapter;
 
 // Журнал хода (ADR-0010): «Стоп» пишет свой исход из ЕДИНОЙ политики остановки, поэтому
 // одинаково виден и в webhook-режиме, и через мост.
-const trace = await import("#lib/trace.ts");
-
-function traceEvents(): Record<string, unknown>[] {
-  try {
-    return readFileSync(trace.traceFilePath(trace.traceDay(), dataDir), "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
-  } catch {
-    return []; // журнала ещё нет — событий тоже
-  }
-}
 
 after(() => rmSync(dataDir, { recursive: true, force: true }));
 
-function eventContext({ chatId, sessionId }: EventOptions) {
+function eventContext({
+  chatId,
+  sessionId,
+  chatType = "private",
+}: EventOptions) {
   const ctx = new ContextContainer();
   ctx.set(SessionKey, {
     auth: { current: null, initiator: null },
@@ -162,7 +146,7 @@ function eventContext({ chatId, sessionId }: EventOptions) {
   const state = {
     ...adapter.state,
     chatId: String(chatId),
-    chatType: "private",
+    chatType,
     messageThreadId: null,
   };
   return {
@@ -217,7 +201,7 @@ function holdSend(chatId: string) {
   return { release: releaseResolve, started };
 }
 
-test("turn.failed posts a humanized error with error id even when finishStatus CAS misses", async () => {
+test("turn.failed posts a humanized error without error id even when finishStatus CAS misses", async () => {
   const chatId = "701";
   const sessionId = "failed-session-cas-miss";
   const key = chatKeyOf(chatId);
@@ -245,7 +229,7 @@ test("turn.failed posts a humanized error with error id even when finishStatus C
   assert.equal(sends.length, 1);
   assert.equal(
     sends[0].body!.text,
-    "Provider limit exhausted - resets in 3hr 59min; wait or switch models: /model\n\nError id: err-limit-701",
+    "Provider limit exhausted - resets in 3hr 59min; wait or switch models: /model",
   );
   assert.equal(getChatStatus(key)!.sessionId, "newer-session");
 
@@ -270,7 +254,7 @@ test("session.failed clears its run-status and deduplicates repeated delivery", 
     status: "running",
     sessionId,
     turnId: "turn_0",
-    statusMessageId: 55,
+    draftId: 55,
   });
   const before = apiCalls.length;
   const data = {
@@ -286,12 +270,11 @@ test("session.failed clears its run-status and deduplicates repeated delivery", 
   assert.equal(status!.status, "idle");
   assert.equal(status!.sessionId, undefined);
   assert.equal(status!.turnId, undefined);
-  assert.equal(callsSince(before, "deleteMessage").length, 1);
-  assert.equal(callsSince(before, "deleteMessage")[0].body!.message_id, 55);
+  assert.equal(callsSince(before, "deleteMessage").length, 0);
   assert.equal(callsSince(before, "sendMessage").length, 1);
   assert.equal(
     callsSince(before, "sendMessage")[0].body!.text,
-    "Provider balance/plan exhausted - top up or switch models: /model\n\nError id: err-billing-702",
+    "Provider balance/plan exhausted - top up or switch models: /model",
   );
 
   await emitSessionFailed(data, { chatId, sessionId });
@@ -309,7 +292,7 @@ test("session.waiting after a lost terminal event deletes the orphan working ind
     status: "running",
     sessionId,
     turnId: "turn_0",
-    statusMessageId: 66,
+    draftId: 66,
     ingressId: "ingress-704",
   });
   const before = apiCalls.length;
@@ -320,11 +303,10 @@ test("session.waiting after a lost terminal event deletes the orphan working ind
   assert.equal(status!.status, "idle");
   assert.equal(status!.sessionId, undefined);
   assert.equal(status!.turnId, undefined);
-  assert.equal(status!.statusMessageId, undefined);
+  assert.equal(status!.draftId, undefined);
   assert.equal(status!.ingressId, undefined);
   const deletes = callsSince(before, "deleteMessage");
-  assert.equal(deletes.length, 1);
-  assert.equal(deletes[0].body!.message_id, 66);
+  assert.equal(deletes.length, 0);
 });
 
 test("session.waiting after normal cleanup or for a stale session is a no-op", async () => {
@@ -334,7 +316,7 @@ test("session.waiting after normal cleanup or for a stale session is a no-op", a
   setChatStatus(key, {
     status: "idle",
     sessionId: null,
-    statusMessageId: null,
+    draftId: null,
   });
   const before = apiCalls.length;
   await emitSessionWaiting({ chatId, sessionId: "already-cleaned" });
@@ -346,13 +328,13 @@ test("session.waiting after normal cleanup or for a stale session is a no-op", a
     status: "running",
     sessionId: "newer-session",
     turnId: "turn_1",
-    statusMessageId: 90,
+    draftId: 90,
   });
   await emitSessionWaiting({ chatId, sessionId: "stale-session" });
   const status = getChatStatus(key);
   assert.equal(status!.status, "running");
   assert.equal(status!.sessionId, "newer-session");
-  assert.equal(status!.statusMessageId, 90);
+  assert.equal(status!.draftId, 90);
   assert.equal(callsSince(before, "deleteMessage").length, 0);
 });
 
@@ -467,8 +449,7 @@ test("turn.failed redacts a provider key before it reaches Bot API", async () =>
   assert.equal(sends.length, 1);
   const text = String(sends[0].body!.text);
   assert.equal(text.includes("zzzz"), false);
-  assert.equal(text.includes("[REDACTED]"), true);
-  assert.equal(text.endsWith("Error id: err-key-706"), true);
+  assert.equal(text.includes("err-key-706"), false);
 });
 
 // errorId никто не чистит по дороге: если шов канала снять, ключ уедет в чат целым.
@@ -495,7 +476,7 @@ test("turn.failed redacts a secret carried by errorId itself", async () => {
   assert.equal(sends.length, 1);
   const text = String(sends[0].body!.text);
   assert.equal(text.includes("zzzz"), false);
-  assert.equal(text.endsWith("Error id: [REDACTED]"), true);
+  assert.equal(text.includes("Error id"), false);
 });
 
 // Худший вход разом: пусто в message, многострочный стек и оба секрета в одной ошибке.
@@ -509,7 +490,7 @@ test("session.failed survives an empty error and redacts a multi-line one", asyn
     );
     const empty = callsSince(emptyBefore, "sendMessage");
     assert.equal(empty.length, 1);
-    assert.equal(empty[0].body!.text, "Turn failed: Unknown provider error");
+    assert.match(String(empty[0].body!.text), /^I could not answer: /u);
 
     const before = apiCalls.length;
     await emitSessionFailed(
@@ -527,9 +508,185 @@ test("session.failed survives an empty error and redacts a multi-line one", asyn
     assert.equal(text.includes("zzzz"), false);
     assert.equal(text.includes("AAAA"), false);
     assert.equal(text.includes("at stack"), false);
-    assert.equal(text.includes("[REDACTED]"), true);
+    assert.equal(text.includes("err-hostile-709"), false);
   } finally {
     restore();
+  }
+});
+
+// Обрыв посреди ответа (c1, 07.10.2026): eve закрыла ход, не повторяя его. Владелец получает
+// вопрос и кнопку «Повторить» — кнопка живёт только в rich-сообщении, поэтому реплика идёт
+// sendRichMessage, а не голым sendMessage. Error id остаётся в журнале.
+test("a stream broken mid-answer posts one Try again button through a rich message", async () => {
+  const chatId = "720";
+  const sessionId = "failed-mid-answer";
+  const previous = process.env.MODEL_PROVIDER;
+  process.env.MODEL_PROVIDER = "claude";
+  const before = apiCalls.length;
+  try {
+    await emitTurnFailed(
+      {
+        code: "MODEL_CALL_FAILED",
+        details: { errorId: "err-mid-720", attempts: 1, answerStarted: true },
+        message:
+          "api.anthropic.com did not finish the response (the stream broke off before message_stop)",
+        sequence: 0,
+        turnId: "turn_0",
+      },
+      { chatId, sessionId },
+    );
+  } finally {
+    if (previous === undefined) delete process.env.MODEL_PROVIDER;
+    else process.env.MODEL_PROVIDER = previous;
+  }
+  assert.equal(callsSince(before, "sendMessage").length, 0);
+  const rich = callsSince(before, "sendRichMessage");
+  assert.equal(rich.length, 1);
+  const markdown = String(
+    (rich[0].body!.rich_message as { markdown?: unknown }).markdown,
+  );
+  assert.match(
+    markdown,
+    /The connection to Anthropic broke off in the middle/u,
+  );
+  assert.match(
+    markdown,
+    /<tg-button type="callback_data" data="Try again">Try again<\/tg-button>/u,
+  );
+  assert.equal(markdown.includes("err-mid-720"), false);
+  assert.equal(String(rich[0].body!.chat_id), chatId);
+});
+
+// Первый запрос хода оборвался — вопроса в истории сессии нет. Канал помнит текст
+// последнего принятого сообщения чата и цитирует его; «Повторить» в тексте нажатия
+// приносит модели и цитату.
+test("a mid-answer break quotes the last accepted message of the chat", async () => {
+  const chatId = "721";
+  const { rememberTurnQuestion } = await import("#lib/turn-question.ts");
+  rememberTurnQuestion(chatKeyOf(chatId), {
+    text: "Сколько <b>стоит</b> *ремонт*?",
+    media: false,
+  });
+  const before = apiCalls.length;
+  await emitTurnFailed(
+    {
+      code: "MODEL_CALL_FAILED",
+      details: { errorId: "err-mid-721", attempts: 1, answerStarted: true },
+      message: "terminated",
+      sequence: 0,
+      turnId: "turn_0",
+    },
+    { chatId, sessionId: "failed-mid-answer-quote" },
+  );
+  const rich = callsSince(before, "sendRichMessage");
+  assert.equal(rich.length, 1);
+  const markdown = String(
+    (rich[0].body!.rich_message as { markdown?: unknown }).markdown,
+  );
+  assert.match(
+    markdown,
+    /in the middle of the answer to «Сколько ‹b›стоит‹\/b› \\\*ремонт\\\*\?»\. Try again\?/u,
+  );
+  assert.equal((markdown.match(/<tg-button[\s>]/gu) ?? []).length, 1);
+});
+
+async function midAnswerNotice(
+  chatId: string,
+  question: { text: string; media: boolean },
+  chatType = "private",
+): Promise<{ rich: string | null; plain: string | null }> {
+  const { rememberTurnQuestion } = await import("#lib/turn-question.ts");
+  rememberTurnQuestion(chatKeyOf(chatId), question);
+  const before = apiCalls.length;
+  await emitTurnFailed(
+    {
+      code: "MODEL_CALL_FAILED",
+      details: { errorId: `err-${chatId}`, attempts: 1, answerStarted: true },
+      message: "terminated",
+      sequence: 0,
+      turnId: "turn_0",
+    },
+    { chatId, sessionId: `mid-answer-${chatId}`, chatType },
+  );
+  const rich = callsSince(before, "sendRichMessage")[0];
+  const plain = callsSince(before, "sendMessage")[0];
+  return {
+    rich: rich
+      ? String((rich.body!.rich_message as { markdown?: unknown }).markdown)
+      : null,
+    plain: plain ? String(plain.body!.text) : null,
+  };
+}
+
+test("in a group the break notice names «your message» and never quotes it", async () => {
+  const { rich } = await midAnswerNotice(
+    "-1001722",
+    { text: "личное про зарплату", media: false },
+    "supergroup",
+  );
+  assert.ok(rich !== null);
+  assert.match(
+    rich,
+    /in the middle of the answer to your message\. Try again\?/u,
+  );
+  assert.doesNotMatch(rich, /зарплат/u);
+});
+
+test("a message with an attachment is asked again, without a button", async () => {
+  const { rich, plain } = await midAnswerNotice("723", {
+    text: "",
+    media: true,
+  });
+  assert.equal(rich, null);
+  assert.equal(
+    plain,
+    "The connection to the provider broke off in the middle of the answer to your message with an attachment. Send it again.",
+  );
+});
+
+// Провод канала, а не только модуль вопроса: принятое голосовое или фото без подписи
+// стирает прежний вопрос и метит вложение, и после обрыва кнопки нет — Ива просит прислать
+// сообщение ещё раз (мутант «media: false» в канале обязан краснеть здесь).
+test("a voice or a photo without a caption, then a mid-answer break: no button, send it again", async () => {
+  const { rememberTurnQuestion } = await import("#lib/turn-question.ts");
+  for (const [chatId, raw] of [
+    ["724", { voice: { file_id: "voice-1", duration: 3 } }],
+    ["725", { photo: [{ file_id: "photo-1", width: 1, height: 1 }] }],
+  ] as const) {
+    rememberTurnQuestion(chatKeyOf(chatId), {
+      text: "прежний вопрос",
+      media: false,
+    });
+    await rememberAccepted(
+      chatKeyOf(chatId),
+      {
+        attachments: [],
+        caption: "",
+        chat: { id: chatId, type: "private" },
+        messageId: "1",
+        raw,
+        text: "",
+      },
+      Promise.resolve({ auth: null }),
+    );
+    const before = apiCalls.length;
+    await emitTurnFailed(
+      {
+        code: "MODEL_CALL_FAILED",
+        details: { errorId: `err-${chatId}`, attempts: 3, answerStarted: true },
+        message: "terminated",
+        sequence: 0,
+        turnId: "turn_0",
+      },
+      { chatId, sessionId: `media-${chatId}` },
+    );
+    assert.equal(callsSince(before, "sendRichMessage").length, 0);
+    const sends = callsSince(before, "sendMessage");
+    assert.equal(sends.length, 1);
+    const text = String(sends[0].body!.text);
+    assert.match(text, /to your message with an attachment/u);
+    assert.match(text, /Send it again\.$/u);
+    assert.doesNotMatch(text, /tg-button|прежний вопрос/u);
   }
 });
 
@@ -579,6 +736,13 @@ test("every live-turn event refreshes run-status, and actions.requested keeps Ev
       turnId: "turn_0",
       firstOutputAt: 1,
     });
+    const { telegramDraftTurn } = await import("#lib/telegram-draft.ts");
+    telegramDraftTurn(
+      { chatId, request: () => Promise.resolve({ ok: true, body: {} }) },
+      sessionId,
+      "turn_0",
+      false,
+    );
     const before = getChatStatus(key)!;
     const apiBefore = apiCalls.length;
     await new Promise((resolve) => setTimeout(resolve, 5)); // Date.now() ходит по миллисекундам
@@ -602,7 +766,7 @@ test("every live-turn event refreshes run-status, and actions.requested keeps Ev
     // канал обязан сохранить это сам.
     assert.equal(
       callsSince(apiBefore, "sendChatAction").length,
-      name === "actions.requested" ? 1 : 0,
+      0,
       `${name}: индикатор набора`,
     );
   }
@@ -632,336 +796,72 @@ test("a heartbeat from a finished or foreign turn is refused by the same wiring"
   assert.equal(after.sessionId, "live-session");
 });
 
-// --- Кнопка ⏹ Стоп в webhook-режиме ---
-//
-// В штатном long-poll нажатие перехватывает мост (scripts/poller/main.ts зовёт
-// handleControl до любой доставки) и до eve оно не доходит. В webhook-режиме моста нет
-// вовсе, апдейт идёт прямо в канал — и тогда работает onCallbackQuery. Здесь дёргается
-// НАСТОЯЩИЙ вебхук-роут канала: проверяется, что eve доводит колбэк до обработчика, а тот
-// зовёт собственный cancel-роут с токеном и turnId из run-status.
-const webhookRoute = channel.routes.find(
-  (candidate) =>
-    candidate.transport !== "websocket" &&
-    candidate.method === "POST" &&
-    candidate.path === "/eve/v1/telegram",
-);
-if (!webhookRoute || webhookRoute.transport === "websocket")
-  throw new Error("telegramChannel did not expose its webhook route");
-const webhookHandler = webhookRoute.handler;
-
-const unusedRouteArg = () => {
-  throw new Error("not used by the callback-query path");
+// Знак очереди под сообщением, которое ждёт своего хода (agent/lib/telegram-turn-start.ts).
+const queuedSign = (sessionId: string, messageId: number) => ({
+  queuedIngressId: `ingress-${messageId}`,
+  queuedIngressAt: 1_000,
+  queuedSessionId: sessionId,
+});
+const signCleared = {
+  queuedIngressId: null,
+  queuedIngressAt: null,
+  queuedSessionId: null,
 };
 
-async function postWebhookUpdate(update: Record<string, unknown>) {
-  // Канал подтверждает вебхук раньше диспетчеризации и уводит работу в waitUntil —
-  // без дожидания фоновых задач тест увидел бы пустоту.
-  const background: Promise<unknown>[] = [];
-  const routeSession: Session = {
-    id: "webhook-test-session",
-    send: unusedRouteArg,
-    respond: unusedRouteArg,
-    cancel: unusedRouteArg,
-    compact: unusedRouteArg,
-    clear: unusedRouteArg,
-    reset: unusedRouteArg,
-    getEventStream: unusedRouteArg,
-    getStreamTailIndex: unusedRouteArg,
-  };
-  const source: ChannelSource<TelegramChannelState> = {
-    send: unusedRouteArg,
-    respond: (responses) => {
-      hitlResponses.push([...responses]);
-      return Promise.resolve(routeSession);
-    },
-    cancel: unusedRouteArg,
-    compact: unusedRouteArg,
-    clear: unusedRouteArg,
-    reset: unusedRouteArg,
-  };
-  const routeArgs: RouteHandlerArgs<TelegramChannelState> = {
-    attachSession: () => routeSession,
-    from: () => source,
-    resolveSession: () => Promise.resolve(routeSession),
-    to: unusedRouteArg,
-    params: {},
-    waitUntil: (task: Promise<unknown>) => {
-      background.push(Promise.resolve(task));
-    },
-    requestIp: "127.0.0.1",
-  };
-  const response = await webhookHandler(
-    new Request("http://iva.test/eve/v1/telegram", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-telegram-bot-api-secret-token": "failure-test-secret",
-      },
-      body: JSON.stringify(update),
-    }),
-    routeArgs,
-  );
-  await Promise.all(background);
-  return response;
-}
-
-function stopTap(chatId: string, fromId: number, chatType?: string) {
-  return {
-    update_id: 900 + fromId,
-    callback_query: {
-      id: `cq-${chatId}`,
-      from: { id: fromId, is_bot: false },
-      message: {
-        message_id: 5,
-        date: 1,
-        chat: { id: Number(chatId), type: chatType ?? "private" },
-      },
-      data: "iva_cancel",
-    },
-  };
-}
-
-test("the Stop button reaches the channel's own cancel route when no bridge is running", async () => {
-  const chatId = "731";
+test("session.failed deletes only the queued sign of its own session", async () => {
+  const chatId = "760";
   const key = chatKeyOf(chatId);
-  setChatStatus(key, {
-    status: "running",
-    sessionId: "webhook-stop-session",
-    turnId: "turn_7",
-  });
-  const before = apiCalls.length;
+  const data = { code: "X", message: "dead", sessionId: "s-dead" };
 
-  await postWebhookUpdate(stopTap(chatId, 9));
-
-  const cancels = callsSince(before, "cancel");
-  assert.equal(cancels.length, 1, "нажатие не дошло до cancel-роута");
-  assert.deepEqual(cancels[0].body, {
-    sessionId: "webhook-stop-session",
-    turnId: "turn_7",
-  });
-  const acks = callsSince(before, "answerCallbackQuery");
-  assert.equal(acks.length, 1);
-  assert.equal(acks[0].body!.text, "Stopping…");
-});
-
-test("Trace: исход «Стопа» ложится в журнал хода", async () => {
-  const chatId = "739";
-  const key = chatKeyOf(chatId);
-  setChatStatus(key, {
-    status: "running",
-    sessionId: "trace-stop-session",
-    turnId: "turn_11",
-  });
-  const before = traceEvents().length;
-
-  await postWebhookUpdate(stopTap(chatId, 9));
-
-  const stops = traceEvents()
-    .slice(before)
-    .filter((event) => event.kind === "stop");
-  assert.equal(stops.length, 1);
-  assert.equal(stops[0].name, "requested");
-  assert.equal(stops[0].turn, "turn_11");
-  assert.equal(stops[0].session, "trace-stop-session");
-  assert.deepEqual(stops[0].data, { chatKey: key, outcome: "requested" });
-});
-
-test("an idle chat and an untrusted tap never reach the cancel route", async () => {
-  const idleChat = "732";
-  setChatStatus(chatKeyOf(idleChat), { status: "idle" });
-  const beforeIdle = apiCalls.length;
-  await postWebhookUpdate(stopTap(idleChat, 9));
-  assert.equal(callsSince(beforeIdle, "cancel").length, 0);
+  // Знак сообщения, вставшего за ходом чужой (живой) сессии, упавшая сессия не трогает.
+  setChatStatus(key, { status: "idle", ...queuedSign("s-live", 961) });
+  let before = apiCalls.length;
+  await emitSessionFailed(data, { chatId, sessionId: "s-dead" });
+  assert.equal(getChatStatus(key)?.queuedIngressId, "ingress-961");
   assert.equal(
-    callsSince(beforeIdle, "answerCallbackQuery")[0].body!.text,
-    "Nothing is running right now.",
+    callsSince(before, "deleteMessage").some(
+      (call) => call.body?.message_id === 961,
+    ),
+    false,
   );
 
-  const liveChat = "733";
-  setChatStatus(chatKeyOf(liveChat), {
-    status: "running",
-    sessionId: "guarded-session",
-    turnId: "turn_8",
-  });
-  const beforeStranger = apiCalls.length;
-  await postWebhookUpdate(stopTap(liveChat, 4242));
-  assert.equal(callsSince(beforeStranger, "cancel").length, 0);
-  // Спиннер гасим, но чужому нажатию ничего не объясняем.
-  const strangerAcks = callsSince(beforeStranger, "answerCallbackQuery");
-  assert.equal(strangerAcks.length, 1);
-  assert.equal(strangerAcks[0].body!.text, undefined);
-
-  // HITL-колбэк самого eve ("eve:" — TELEGRAM_HITL_CALLBACK_PREFIX) разбирается ДО
-  // нашего хука: он не наш, до cancel не доходит, и отвечает на него eve.
-  const beforeHitl = apiCalls.length;
-  const beforeHitlResponses = hitlResponses.length;
-  await postWebhookUpdate({
-    ...stopTap(liveChat, 9),
-    callback_query: { ...stopTap(liveChat, 9).callback_query, data: "eve:1" },
-  });
-  assert.equal(callsSince(beforeHitl, "cancel").length, 0);
-  assert.equal(callsSince(beforeHitl, "answerCallbackQuery").length, 1);
-  assert.equal(hitlResponses.length, beforeHitlResponses + 1);
-  assert.equal(hitlResponses.at(-1)?.length, 1);
-
-  // А вот НЕ-HITL чужой колбэк (кнопка меню, долетевшая до eve) попадает уже в наш
-  // хук. Само его наличие навсегда закрывает дефолтную ветку eve «Unsupported
-  // action.», поэтому спиннер обязан гасить канал — иначе он крутится вечно.
-  const beforeForeign = apiCalls.length;
-  await postWebhookUpdate({
-    ...stopTap(liveChat, 9),
-    callback_query: {
-      ...stopTap(liveChat, 9).callback_query,
-      data: "iva_menu:root",
-    },
-  });
-  assert.equal(callsSince(beforeForeign, "cancel").length, 0);
-  const foreignAcks = callsSince(beforeForeign, "answerCallbackQuery");
-  assert.equal(foreignAcks.length, 1, "чужой колбэк остался без ack");
-  assert.equal(foreignAcks[0].body!.text, undefined);
-});
-
-test("non-private webhook Stop callbacks never reach the cancel route", async () => {
-  for (const chatType of ["group", "supergroup", "channel"]) {
-    const chatId = String(740 + apiCalls.length);
-    setChatStatus(chatKeyOf(chatId), {
-      status: "running",
-      sessionId: `guarded-${String(chatType)}`,
-      turnId: "turn_private_boundary",
-    });
-    const before = apiCalls.length;
-    const update = stopTap(chatId, 9, chatType);
-    await postWebhookUpdate(update);
-
-    assert.equal(callsSince(before, "cancel").length, 0, String(chatType));
-    const acknowledgements = callsSince(before, "answerCallbackQuery");
-    assert.equal(acknowledgements.length, 1, String(chatType));
-    const text = acknowledgements[0].body?.text;
-    if (typeof text !== "string") assert.fail(String(chatType));
-    assert.match(text, /private|личн/u, String(chatType));
-  }
-});
-
-// Состарить запись run-status, не трогая её раскладку: ищем файл по sessionId и
-// правим одно поле. Если раскладка изменится, помощник упадёт, а не притворится.
-function backdateStatus(sessionId: string, ageMs: number) {
-  const dir = join(dataDir, "run-status.d");
-  for (const name of readdirSync(dir)) {
-    const file = join(dir, name);
-    const parsed = JSON.parse(readFileSync(file, "utf8")) as {
-      sessionId?: string;
-      updatedAt?: number;
-    };
-    if (parsed.sessionId !== sessionId) continue;
-    writeFileSync(
-      file,
-      JSON.stringify({ ...parsed, updatedAt: Date.now() - ageMs }),
-    );
-    return;
-  }
-  throw new Error(`run-status record for ${sessionId} not found`);
-}
-
-// Терминальное событие отмены: ровно такую запись оставляет turn.cancelled канала.
-// Без него «Стоп» обязан ждать подтверждения до самого дедлайна.
-function finishCancelledTurn(sessionId: unknown) {
-  if (typeof sessionId !== "string") return;
-  const dir = join(dataDir, "run-status.d");
-  for (const name of readdirSync(dir)) {
-    const file = join(dir, name);
-    const parsed = JSON.parse(readFileSync(file, "utf8")) as {
-      sessionId?: string;
-    };
-    if (parsed.sessionId !== sessionId) continue;
-    writeFileSync(
-      file,
-      JSON.stringify({
-        ...parsed,
-        status: "idle",
-        sessionId: null,
-        turnId: null,
-        wasCancelled: true,
-        updatedAt: Date.now(),
-      }),
-    );
-    return;
-  }
-}
-
-test("a crashed turn's stale status still reaches the cancel route in webhook mode", async () => {
-  // В webhook-режиме жнеца нет вовсе (он живёт в мосте), поэтому запись «running»
-  // после краша процесса лежит вечно. Свежесть записи — не повод молчать: sessionId
-  // в ней есть, и отмену надо спросить у eve. Мёртвый ход сам себя выдаст ответом
-  // no_active_turn, и только это серверное подтверждение считается «отменять нечего».
-  const chatId = "734";
-  const key = chatKeyOf(chatId);
-  setChatStatus(key, {
-    status: "running",
-    sessionId: "crashed-session",
-    turnId: "turn_9",
-  });
-  backdateStatus("crashed-session", 31 * 60_000);
-  assert.equal(getChatStatus(key)!.status, "running"); // запись всё ещё «идёт»
-
-  const before = apiCalls.length;
-  cancelRouteStatus = "no_active_turn";
-  try {
-    await postWebhookUpdate(stopTap(chatId, 9));
-  } finally {
-    cancelRouteStatus = "accepted";
-  }
-
-  const cancels = callsSince(before, "cancel");
-  assert.equal(cancels.length, 1, "нажатие не дошло до cancel-роута");
-  assert.deepEqual(cancels[0].body, {
-    sessionId: "crashed-session",
-    turnId: "turn_9",
-  });
-  assert.equal(
-    callsSince(before, "answerCallbackQuery")[0].body!.text,
-    "Nothing is running right now.",
+  // Свой знак уходит: буфер входа умершей сессии хода уже не начнёт.
+  setChatStatus(key, { ...signCleared, ...queuedSign("s-dead", 962) });
+  before = apiCalls.length;
+  await emitSessionFailed(
+    { ...data, message: "dead again" },
+    { chatId, sessionId: "s-dead" },
+  );
+  assert.equal(getChatStatus(key)?.queuedIngressId, undefined);
+  assert.deepEqual(
+    callsSince(before, "deleteMessage").map((call) => call.body?.message_id),
+    [],
   );
 });
 
-test("Trace: ответ модели уходит в журнал ключом своего хода", async () => {
-  const chatId = "741";
+test("a turn resumed by an answer to a question takes the sign without the queued message's ingressAt", async () => {
+  const chatId = "761";
+  const sessionId = "s-hitl";
   const key = chatKeyOf(chatId);
-  setChatStatus(key, {
-    status: "running",
-    sessionId: "trace-outbox-session",
-    turnId: "turn_12",
-    firstOutputAt: 1,
-  });
-  const before = traceEvents().length;
-  const context = eventContext({
-    chatId,
-    sessionId: "trace-outbox-session",
-  });
+  setChatStatus(key, { status: "idle", ...queuedSign(sessionId, 963) });
+  const context = eventContext({ chatId, sessionId });
 
-  await contextStorage.run(context.ctx, () =>
-    adapter["message.completed"](
+  // eve шлёт input.resolved до turn.started хода, который продолжит ответ на вопрос.
+  await contextStorage.run(context.ctx, async () => {
+    await adapter["input.resolved"](
       {
-        finishReason: "stop",
-        message: "готово, отпуск в июле",
-        sequence: 4,
-        stepIndex: 1,
-        turnId: "turn_12",
+        resolutions: [
+          { kind: "question", outcome: "answered", requestId: "req-1" },
+        ],
       },
       context.value,
-    ),
-  );
+    );
+    await adapter["turn.started"]({ turnId: "turn_hitl" }, context.value);
+  });
 
-  const added = traceEvents().slice(before);
-  const outbox = added.find((event) => event.kind === "outbox");
-  const gate = added.find((event) => event.kind === "gate");
-  // Ключ хода и сессия приходят из канала: без них последнее звено цепочки повисло бы.
-  assert.equal(outbox?.name, "delivered");
-  assert.equal(outbox?.turn, "turn_12");
-  assert.equal(outbox?.session, "trace-outbox-session");
-  assert.equal(outbox?.source, "telegram");
-  assert.equal(gate?.turn, "turn_12");
-  assert.equal(
-    (gate?.data as Record<string, unknown>).text,
-    "готово, отпуск в июле",
-  );
+  const status = getChatStatus(key);
+  assert.equal(typeof status?.draftId, "number");
+  assert.equal(status?.ingressAt, undefined);
+  assert.equal(status?.statusAt, undefined);
+  assert.equal(status?.queuedIngressId, undefined);
 });

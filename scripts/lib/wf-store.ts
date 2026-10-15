@@ -16,9 +16,24 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { createRequire } from "node:module";
 import { throughLink } from "./link-target.ts";
 
 export const TRASH_KEEP = 2;
+const require = createRequire(import.meta.url);
+
+function statusLocks() {
+  // CLI inspection also runs when agent/ is absent. Only recovery needs its locks.
+  const { acquireChatLock } = require("../../agent/lib/run-status.ts") as Pick<
+    typeof import("../../agent/lib/run-status.ts"),
+    "acquireChatLock"
+  >;
+  const { releaseFileLock } = require("../../agent/lib/fs-atomic.ts") as Pick<
+    typeof import("../../agent/lib/fs-atomic.ts"),
+    "releaseFileLock"
+  >;
+  return { acquireChatLock, releaseFileLock };
+}
 
 function hasErrorCode(error: unknown, code: string): boolean {
   return (error as { code?: unknown } | null | undefined)?.code === code;
@@ -143,6 +158,13 @@ function writeRunStatusAtomicSync(path: string, value: unknown): void {
   }
 }
 
+/** Поля знака очереди записи чата (agent/lib/run-status.ts, QUEUED_STATUS_CLEARED). */
+function queuedSignOf(record: object): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(record).filter(([field]) => field.startsWith("queued")),
+  );
+}
+
 function nextGeneration(value: unknown): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value + 1
@@ -162,25 +184,47 @@ export function rewriteRunStatusesForUpdate(
   let rewritten = 0;
   for (const file of interruptedRunStatusFiles(dataDir)) {
     try {
-      const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
-      // A turn Bridge finished since the scan must not be re-armed.
-      if (!isInterruptedRun(parsed)) continue;
-      // An interrupted compaction between turns carried no request from the owner: once
-      // its session is retired the record is simply free again, with a reset tombstone.
-      // Bridge has nothing to close and nothing to tell.
-      const stamp = Date.now();
-      writeRunStatusAtomicSync(
-        file,
-        retired && parsed.compacting === true
-          ? {
-              status: "idle",
-              generation: nextGeneration(parsed.generation),
-              updatedAt: stamp,
-              resetAt: stamp,
-            }
-          : { ...parsed, status: "running", updatedAt: 0 },
-      );
-      rewritten++;
+      const snapshot: unknown = JSON.parse(readFileSync(file, "utf8"));
+      if (!isInterruptedRun(snapshot)) continue;
+      const { acquireChatLock, releaseFileLock } = statusLocks();
+      // Recovery runs after the service stops; reclaim a killed writer's fresh lock.
+      // A live writer stalled for over two seconds can lose it (FileLock-sync-slow).
+      const lock = acquireChatLock(file, 2_000);
+      try {
+        const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+        // Fence the snapshot and publication with the same lock as live chat writers.
+        if (
+          !isInterruptedRun(parsed) ||
+          !Object.is(parsed.generation, snapshot.generation)
+        )
+          continue;
+        // An interrupted compaction between turns carried no request from the owner: once
+        // its session is retired the record is simply free again, with a reset tombstone.
+        // Bridge has nothing to close and nothing to tell. A queued sign (queued* fields)
+        // stays: there is no Bot API before the start to delete it, and the next turn of
+        // the chat deletes it by these fields (specs/IdleCompaction.tla, SignOwned).
+        const stamp = Date.now();
+        writeRunStatusAtomicSync(
+          file,
+          retired && parsed.compacting === true
+            ? {
+                ...queuedSignOf(parsed),
+                status: "idle",
+                generation: nextGeneration(parsed.generation),
+                updatedAt: stamp,
+                resetAt: stamp,
+              }
+            : {
+                ...parsed,
+                generation: nextGeneration(parsed.generation),
+                status: "running",
+                updatedAt: 0,
+              },
+        );
+        rewritten++;
+      } finally {
+        releaseFileLock(lock);
+      }
     } catch (error) {
       // One damaged chat record must not block the update or its healthy neighbors;
       // a record that cannot be written is named in the journal.

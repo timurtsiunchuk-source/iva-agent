@@ -201,32 +201,24 @@ void test("ошибка записи не выходит наружу", (t) => {
   assert.ok(errors[0].startsWith("[trace] событие не записано:"));
 });
 
-void test("чистка удаляет файлы старше 14 дней ПО ИМЕНИ и не трогает чужие", () => {
+void test("чистка оставляет 30 дней ПО ИМЕНИ, удаляет 31-й и не трогает чужие", () => {
   const dir = world();
   mkdirSync(trace.traceDir(dir), { recursive: true });
-  const names = [
-    "2026-08-17.jsonl", // сегодня
-    "2026-08-04.jsonl", // граница окна: 14-й день
-    "2026-08-03.jsonl", // на день старше окна
-    "2026-07-01.jsonl",
-    "notes.md",
-    "2026-08-05.jsonl.bak",
-    "old.jsonl",
-  ];
-  for (const name of names) writeFileSync(join(trace.traceDir(dir), name), "");
+  // 31 день подряд до сегодняшнего: 2026-07-18 … 2026-08-17.
+  const days = Array.from({ length: 31 }, (_, back) =>
+    new Date(Date.UTC(2026, 7, 17 - back)).toISOString().slice(0, 10),
+  );
+  const foreign = ["notes.md", "2026-07-05.jsonl.bak", "old.jsonl"];
+  const names = [...days.map((day) => `${day}.jsonl`), "2026-07-01.jsonl"];
+  for (const name of [...names, ...foreign])
+    writeFileSync(join(trace.traceDir(dir), name), "");
 
   const removed = trace.pruneTrace(dir, "2026-08-17");
 
-  assert.deepEqual(removed.sort(), ["2026-07-01.jsonl", "2026-08-03.jsonl"]);
+  assert.deepEqual(removed.sort(), ["2026-07-01.jsonl", "2026-07-18.jsonl"]);
   assert.deepEqual(
     readdirSync(trace.traceDir(dir)).sort(),
-    [
-      "2026-08-04.jsonl",
-      "2026-08-17.jsonl",
-      "2026-08-05.jsonl.bak",
-      "notes.md",
-      "old.jsonl",
-    ].sort(),
+    [...names.slice(0, 30), ...foreign].sort(),
   );
 });
 
@@ -346,11 +338,69 @@ void test("мост пишет свои события тем же ключом 
     kind: "message",
     accepted: true,
     ms: 42,
+    parts: 1,
   });
   assert.equal(callback?.turn, "tg:77:cb:cb1");
   assert.deepEqual(
     (callback?.data as Record<string, unknown>).decision,
     "terminal-drop",
+  );
+});
+
+void test("мост пишет постановку в очередь и число частей пачки без содержимого", () => {
+  const queued = {
+    update_id: 910,
+    message: { message_id: 11, chat: { id: 77 }, text: "слова-постановки-910" },
+  };
+  trace.traceBridgeQueued(queued, 2);
+  const batch = {
+    update_id: 913,
+    message: {
+      message_id: 11,
+      chat: { id: 77 },
+      text: "слова-первое",
+      iva_parts: [
+        { text: "слова-первое" },
+        { text: "слова-второе" },
+        { text: "слова-третье" },
+      ],
+    },
+  };
+  trace.traceBridgeDelivery(batch, true, 7);
+  trace.traceBridgeDelivery({ ...batch, update_id: 914 }, false, 5_000);
+
+  const events = lines(DATA, trace.traceDay());
+  const enqueued = last(
+    events,
+    (event) => event.kind === "bridge" && event.name === "queued",
+  );
+  assert.equal(enqueued?.turn, "tg:77:11");
+  assert.deepEqual(enqueued?.data, {
+    updateId: 910,
+    chatId: 77,
+    messageId: "11",
+    kind: "message",
+    count: 2,
+    parts: 1,
+  });
+  const delivered = last(
+    events,
+    (event) => event.name === "delivered" && event.turn === "tg:77:11",
+  );
+  assert.deepEqual(delivered?.data, {
+    updateId: 913,
+    chatId: 77,
+    messageId: "11",
+    kind: "message",
+    accepted: true,
+    ms: 7,
+    parts: 3,
+  });
+  const rejected = last(events, (event) => event.name === "rejected");
+  assert.equal((rejected?.data as Record<string, unknown>).parts, 3);
+  assert.equal(
+    JSON.stringify([enqueued, delivered, rejected]).includes("слова-"),
+    false,
   );
 });
 
@@ -668,4 +718,19 @@ void test("протухшая метка хода не приписывает в
     Date.now = realNow;
   }
   assert.equal(lines(DATA, trace.traceDay()).length, before + 1);
+});
+
+void test("native draft stop intake uses its update id and private chat in Trace", () => {
+  const before = lines(DATA, trace.traceDay()).length;
+  trace.traceBridgeAdmission(
+    {
+      update_id: 991,
+      stopped_message_generation: { chat: { id: 77 }, draft_id: 41 },
+    },
+    "owned",
+  );
+  const event = lines(DATA, trace.traceDay())
+    .slice(before)
+    .find((row) => row.turn === "tg:77:stop:991");
+  assert.ok(event);
 });

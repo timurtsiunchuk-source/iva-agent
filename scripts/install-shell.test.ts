@@ -22,7 +22,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, type TestContext } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+import {
+  eveArchive,
+  NPM_CLI,
+  type ArchiveFault,
+} from "./fixtures/eve-archive.ts";
 
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
 
@@ -264,9 +270,12 @@ case "$1" in
     printf '%s\\n' "$IVA_TEST_NPM_PREFIX"
     ;;
   ci|install)
+    if [ -n "$IVA_TEST_REAL_NPM" ]; then
+      "$IVA_TEST_NODE" "$IVA_TEST_REAL_NPM" "$@"
+      exit $?
+    fi
     mkdir -p node_modules/.bin
     cp package-lock.json node_modules/.package-lock.json
-    ln -sf "$IVA_TEST_RECORDER" node_modules/.bin/patch-package
     ;;
   exec)
     case "$*" in
@@ -371,6 +380,7 @@ if (args[0] === "_activate-units" && process.env.IVA_TEST_UNITS_FAIL) {
 `;
 
 type RunOptions = {
+  readonly args?: readonly string[];
   readonly calls?: string;
   readonly env?: Readonly<Record<string, string>>;
   /** The installer to run, when it must be one sitting inside the installation. */
@@ -546,10 +556,6 @@ function createWorld(t: TestContext, options: { env?: boolean } = {}): World {
   // The installation carries the installer, as the repository does: it is the one a re-run
   // over it executes.
   cpSync(join(ROOT, "install.sh"), join(install, "install.sh"));
-  // A patched dependency, like the real installation has: the hook that applies it is
-  // npm's, so skipping npm has to apply it instead.
-  mkdirSync(join(install, "patches"), { recursive: true });
-  writeFileSync(join(install, "patches/eve+0.30.8.patch"), "");
   // The shipped ignore rules, so what the installer leaves behind is judged by them.
   cpSync(join(ROOT, ".gitignore"), join(install, ".gitignore"));
 
@@ -565,7 +571,15 @@ function createWorld(t: TestContext, options: { env?: boolean } = {}): World {
   git("commit", "--quiet", "-m", "fixture");
   // A release is a vX.Y.Z tag: a new installation checks out the newest one.
   git("tag", "v1.0.0");
-  execFileSync("git", ["clone", "--quiet", "--bare", install, remote]);
+  // Use Git transport rather than racing a filesystem copy of loose objects.
+  execFileSync("git", [
+    "clone",
+    "--quiet",
+    "--no-local",
+    "--bare",
+    install,
+    remote,
+  ]);
   git("remote", "add", "origin", remote);
 
   if (options.env !== false)
@@ -613,7 +627,7 @@ function createWorld(t: TestContext, options: { env?: boolean } = {}): World {
             installer,
             "--non-interactive",
           ]
-        : [installer, "--non-interactive"];
+        : [installer, ...(runOptions.args ?? ["--non-interactive"])];
       return spawnSync("bash", argv, {
         cwd: dir,
         encoding: "utf8",
@@ -1574,21 +1588,6 @@ void test("an installation without git rebuilds instead of trusting the stamp", 
   assert.match(world.calls(join(world.dir, "second.log")), /eve build/u);
 });
 
-void test("patches with nothing to apply them mean a full install, not a reuse", (t) => {
-  const world = createWorld(t);
-  assert.equal(world.run().status, 0);
-
-  // What `npm prune --production` leaves behind: the tree still matches the lockfile by
-  // npm's own record, but the tool that puts the patches on top is gone.
-  rmSync(join(world.install, "node_modules/.bin/patch-package"), {
-    force: true,
-  });
-
-  const second = world.run({ calls: join(world.dir, "second.log") });
-  assert.equal(second.status, 0, second.stdout + second.stderr);
-  assert.match(world.calls(join(world.dir, "second.log")), /^npm ci$/mu);
-});
-
 void test("a failure at the last stage restores the checkout and leaves nothing behind", (t) => {
   const world = createWorld(t);
   // What the user has: an edit of their own, a file of their own, and a build.
@@ -1680,9 +1679,7 @@ void test("a re-run over a finished install skips the stages that are already do
   assert.doesNotMatch(secondCalls, /^npm i -g /mu);
   assert.doesNotMatch(secondCalls, /eve build/u);
   assert.doesNotMatch(secondCalls, /agent-browser install/u);
-  // Skipped, not forgotten: the dependencies are still checked against the lockfile and
-  // the patches re-applied, and the units are still written and enabled.
-  assert.match(secondCalls, /^patch-package\s*$/mu);
+  // The lockfile is still checked, and the units are still written and enabled.
   assert.match(secondCalls, /^iva _install-units$/mu);
   assert.match(secondCalls, /^iva _activate-units$/mu);
 
@@ -1886,4 +1883,169 @@ void test("a re-run over a versioned installation starts the updater it already 
   assert.match(world.calls(), /^iva update$/mu);
   // Клона в версионную раскладку не бывает: чекаута там нет и не появляется.
   assert.equal(existsSync(join(versioned, ".git")), false);
+});
+
+for (const fault of [
+  "ok",
+  "404",
+  "drop",
+  "integrity",
+  "truncated",
+] satisfies ArchiveFault[]) {
+  void test(`fresh installer fetches the locked eve archive: ${fault}`, async (t) => {
+    const world = createWorld(t, { env: false });
+    const archive = await eveArchive(t, world.dir);
+    archive.setFault(fault);
+    archive.writeManifest(world.install, "1.0.1");
+    if (fault === "truncated") {
+      // The retry must enter the shipped updater through repair, with the failed
+      // checkout and npm cache still present.
+      const cli = readFileSync(join(ROOT, "bin/iva.mjs"), "utf8")
+        .replace(
+          '"../scripts/cli/main.ts"',
+          JSON.stringify(pathToFileURL(join(ROOT, "scripts/cli/main.ts")).href),
+        )
+        .replace(
+          '"../scripts/lib/version-layout.ts"',
+          JSON.stringify(
+            pathToFileURL(join(ROOT, "scripts/lib/version-layout.ts")).href,
+          ),
+        );
+      writeFileSync(join(world.install, "bin/iva.mjs"), cli);
+      writeFileSync(
+        join(world.install, "scripts/update-finish.ts"),
+        `import { main } from ${JSON.stringify(pathToFileURL(join(ROOT, "scripts/update-finish.ts")).href)}; process.exitCode = await main(process.argv.slice(2));\n`,
+      );
+      world.git("add", "bin/iva.mjs", "scripts/update-finish.ts");
+    }
+
+    world.git("add", "package.json", "package-lock.json", ".npmrc");
+    world.git("commit", "--quiet", "-m", "archive dependency");
+    world.git("tag", "v1.0.1");
+    world.git("push", "--quiet", "--tags", "origin", "main");
+    rmSync(world.install, { recursive: true, force: true });
+    const options = {
+      script: world.piped,
+      env: { IVA_TEST_REAL_NPM: NPM_CLI },
+    };
+    const result = await world.runAsync(options).done;
+    assert.match(world.calls(), /^npm ci$/mu);
+    assert.ok(archive.requests.includes("/asset.tgz"), result.output);
+    assert.equal(result.code, fault === "ok" ? 0 : 1, result.output);
+    if (fault === "ok") {
+      assert.equal(
+        (
+          JSON.parse(
+            readFileSync(
+              join(world.install, "node_modules/eve/package.json"),
+              "utf8",
+            ),
+          ) as { version: string }
+        ).version,
+        "0.51.1-iva.1",
+      );
+    } else {
+      assert.equal(existsSync(join(world.install, "current")), false);
+      assert.equal(
+        existsSync(join(world.install, ".output/server.mjs")),
+        false,
+      );
+      assert.match(
+        result.output,
+        fault === "404"
+          ? /E404/u
+          : fault === "integrity"
+            ? /EINTEGRITY/u
+            : /ECONNRESET|ETIMEDOUT|EIDLETIMEOUT|ERR_SOCKET_TIMEOUT/u,
+      );
+    }
+    if (fault === "truncated") {
+      archive.setFault("ok");
+      const retryLog = join(world.dir, "retry-npm.log");
+      const retry = await world.runAsync({
+        ...options,
+        env: {
+          ...options.env,
+          REPO_URL: "https://github.com/smixs/iva-agent.git",
+          IVA_TEST_NPM_LOG: retryLog,
+        },
+      }).done;
+      assert.equal(retry.code, 1, retry.output);
+      assert.match(retry.output, /handing it to the updater/u);
+      assert.match(retry.output, /EVE_TEST_STOP_AFTER_CI/u);
+      assert.match(
+        readFileSync(retryLog, "utf8"),
+        /CI_OK .*\/versions\/1\.0\.1-[a-f0-9]{12}/u,
+      );
+      assert.equal(existsSync(join(world.install, "current")), false);
+    }
+    assert.ok(
+      archive.requests.every((url) => ["/eve.tgz", "/asset.tgz"].includes(url)),
+      archive.requests.join("\n"),
+    );
+  });
+}
+
+for (const field of ["resolved", "integrity"] as const) {
+  void test(`installer runs npm ci for the same eve version with a different ${field}`, (t) => {
+    const world = createWorld(t);
+    const first = world.run({ calls: join(world.dir, "first.log") });
+    assert.equal(first.status, 0, first.stdout + first.stderr);
+    const file = join(world.install, "node_modules/.package-lock.json");
+    const lock = JSON.parse(readFileSync(file, "utf8")) as {
+      packages: Record<string, Record<string, string>>;
+    };
+    lock.packages["node_modules/eve"][field] =
+      field === "resolved"
+        ? "https://example.invalid/other.tgz"
+        : "sha512-other";
+    writeFileSync(file, JSON.stringify(lock));
+    const second = world.run({ calls: join(world.dir, "second.log") });
+    assert.equal(second.status, 0, second.stdout + second.stderr);
+    assert.match(world.calls(join(world.dir, "second.log")), /^npm ci$/mu);
+  });
+}
+
+void test("updater GWS path checks the same pinned bytes and preserves credentials", (t) => {
+  const world = createWorld(t);
+  const prefix = join(world.home, "user with spaces", ".local");
+  const credentials = join(world.home, ".config/gws/credentials.json");
+  mkdirSync(join(world.home, ".config/gws"), { recursive: true });
+  writeFileSync(credentials, "fixture authorization");
+  const result = world.run({ args: ["--update-gws", prefix] });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const calls = world.calls();
+  assert.ok(calls.includes(PINNED_ARTIFACTS.gws.url));
+  assert.ok(calls.indexOf("sha256sum ") < calls.indexOf("npm i -g "));
+  assert.ok(calls.includes(`npm i -g --prefix ${prefix} `));
+  assert.doesNotMatch(calls, /latest|systemctl|git |iva |apt-get/u);
+  assert.equal(readFileSync(credentials, "utf8"), "fixture authorization");
+  assert.deepEqual(leftovers(world.tmp), []);
+});
+void test("updater GWS entry works with HOME and INSTALL_DIR unset", (t) => {
+  const world = createWorld(t);
+  const script = join(world.dir, "update-without-home.sh");
+  writeFileSync(
+    script,
+    'unset HOME INSTALL_DIR\nexec bash "$1" --update-gws "$2"\n',
+  );
+  const prefix = join(world.home, "prefix with spaces");
+  const result = world.run({
+    script,
+    args: [join(world.install, "install.sh"), prefix],
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.ok(world.calls().includes(`npm i -g --prefix ${prefix} `));
+  assert.deepEqual(leftovers(world.tmp), []);
+});
+void test("updater GWS path rejects corrupt bytes before npm and removes its download", (t) => {
+  const world = createWorld(t);
+  const result = world.run({
+    args: ["--update-gws", join(world.home, ".local")],
+    env: { IVA_TEST_CORRUPT_ARTIFACT: "gws" },
+  });
+  assert.equal(result.status, 86, result.stdout + result.stderr);
+  assert.match(result.stdout + result.stderr, /SHA-256 mismatch/u);
+  assert.doesNotMatch(world.calls(), /npm i/u);
+  assert.deepEqual(leftovers(world.tmp), []);
 });
